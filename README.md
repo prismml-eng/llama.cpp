@@ -290,6 +290,61 @@ Instructions for adding support for new models: [HOWTO-add-model.md](docs/develo
 | [Hexagon [In Progress]](docs/backend/hexagon/README.md) | Snapdragon |
 | [VirtGPU](docs/backend/VirtGPU.md) | VirtGPU APIR |
 
+## AMD GPU support (ROCm/HIP)
+
+This branch supports running Bonsai Q1_0_g128 models on AMD GPUs via ROCm/HIP. The Q1_0_g128 CUDA kernels are compiled transparently by the HIP toolchain — no separate HIP-specific kernel code is needed.
+
+### Requirements
+
+- ROCm 7.x with hipBLAS and rocBLAS (including device libraries for your GPU target)
+- The easiest way to get a fully configured environment is to use the `rocm/pytorch:rocm7.2_ubuntu24.04_py3.12_pytorch_release_2.10.0` Docker image, which includes gfx1151 (Radeon 8060S / Ryzen AI MAX+) support
+
+### Build
+
+```bash
+HIPCXX=$(hipconfig -l)/clang HIP_PATH=$(hipconfig -R) \
+cmake -B build-hip \
+  -DGGML_HIP=ON \
+  -DGPU_TARGETS=gfx1151 \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DGGML_CUDA_FA=OFF
+cmake --build build-hip --config Release -j$(nproc)
+```
+
+Replace `gfx1151` with your GPU's architecture. Find yours with:
+```bash
+rocminfo | grep gfx | head -1 | awk '{print $2}'
+```
+
+### Run
+
+```bash
+build-hip/bin/llama-cli -m /path/to/Bonsai-8B.gguf -ngl 99 -p "your prompt"
+```
+
+`-ngl 99` offloads all layers to the GPU. On an integrated GPU (APU) that shares system memory, the full model fits in the GPU address space.
+
+### Docker
+
+If your system ROCm installation is partial, build and run inside the Docker image:
+
+```bash
+docker run --rm \
+  --device /dev/kfd --device /dev/dri/card1 --device /dev/dri/renderD128 \
+  --group-add video --group-add render \
+  -v /path/to/llama.cpp:/llama.cpp \
+  -v /path/to/models:/models \
+  rocm/pytorch:rocm7.2_ubuntu24.04_py3.12_pytorch_release_2.10.0 \
+  bash -c "
+    pip install cmake -q && cd /llama.cpp && \
+    HIPCXX=\$(hipconfig -l)/clang HIP_PATH=\$(hipconfig -R) \
+    cmake -B build-hip -DGGML_HIP=ON -DGPU_TARGETS=gfx1151 \
+          -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA_FA=OFF && \
+    cmake --build build-hip -j\$(nproc) && \
+    build-hip/bin/llama-cli -m /models/Bonsai-8B.gguf -ngl 99 -p 'Hello'
+  "
+```
+
 ## Obtaining and quantizing models
 
 The [Hugging Face](https://huggingface.co) platform hosts a [number of LLMs](https://huggingface.co/models?library=gguf&sort=trending) compatible with `llama.cpp`:
