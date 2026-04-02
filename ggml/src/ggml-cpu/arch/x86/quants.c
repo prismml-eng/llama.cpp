@@ -662,37 +662,121 @@ void ggml_vec_dot_q1_0_g128_q8_0(int n, float * GGML_RESTRICT s, size_t bs, cons
     const block_q1_0_g128 * GGML_RESTRICT x = vx;
     const block_q8_0 * GGML_RESTRICT y = vy;
 
+    int ib = 0;
     float sumf = 0;
 
-    // Each Q1_0_g128 block has 128 elements
-    // Each Q8_0 block has 32 elements
-    // So we need 4 Q8_0 blocks per Q1_0_g128 block
-    for (int ib = 0; ib < nb; ++ib) {
+#if defined(__AVX512BW__) && defined(__AVX512VL__) && defined(__AVX512VNNI__)
+    // Hybrid AVX-512 path: stay in 256-bit to avoid lane-crossing overhead, but use
+    // AVX-512BW+VL and VNNI to reduce the inner loop to ~3 instructions per sub-block.
+    //
+    // Bit expansion: _mm256_mask_blend_epi8 uses the 32-bit integer directly as a
+    // __mmask32, selecting +qy where the weight bit is 1 and -qy where it is 0.
+    // That replaces the 7-instruction shuffle/mask/cmp/convert sequence with 2
+    // instructions (sub + mask_blend).
+    //
+    // Dot product: _mm256_dpbusd_epi32(zero, all_ones, signed_qy) sums signed_qy in
+    // groups of 4, giving 8 int32 partial sums that represent the full dot product.
+
+    __m256 acc = _mm256_setzero_ps();
+    const __m256i zero_256     = _mm256_setzero_si256();
+    const __m256i all_ones_256 = _mm256_set1_epi8(1);
+
+    for (; ib < nb; ++ib) {
         const float d0 = GGML_CPU_FP16_TO_FP32(x[ib].d);
-        
-        int sumi = 0;
-        
-        // Process 4 Q8_0 blocks (4 * 32 = 128 elements)
-        for (int k = 0; k < 4; k++) {
+
+        for (int k = 0; k < 4; ++k) {
+            const float   d1       = GGML_CPU_FP16_TO_FP32(y[ib*4 + k].d);
+            const uint32_t qbits32 = *(const uint32_t *)(x[ib].qs + k * 4);
+            const __m256i  qy      = _mm256_loadu_si256((const __m256i *)y[ib*4 + k].qs);
+
+            // Negate qy where bit=0 (weight=-1), keep qy where bit=1 (weight=+1)
+            const __m256i neg_qy    = _mm256_sub_epi8(zero_256, qy);
+            const __m256i signed_qy = _mm256_mask_blend_epi8((__mmask32)qbits32, neg_qy, qy);
+
+            // dpbusd(zero, all_ones, signed_qy) = sum(signed_qy) = dot product
+            const __m256i int_acc = _mm256_dpbusd_epi32(zero_256, all_ones_256, signed_qy);
+
+            acc = _mm256_fmadd_ps(_mm256_set1_ps(d0 * d1), _mm256_cvtepi32_ps(int_acc), acc);
+        }
+    }
+
+    sumf = hsum_float_8(acc);
+
+#elif defined(__AVX2__)
+    __m256 acc = _mm256_setzero_ps();
+
+    // Hoist constants out of the loop
+    const __m256i shuffle_mask = _mm256_set_epi8(
+        3, 3, 3, 3, 3, 3, 3, 3,
+        2, 2, 2, 2, 2, 2, 2, 2,
+        1, 1, 1, 1, 1, 1, 1, 1,
+        0, 0, 0, 0, 0, 0, 0, 0
+    );
+    const __m256i bit_mask = _mm256_set_epi8(
+        (char)0x80, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01,
+        (char)0x80, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01,
+        (char)0x80, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01,
+        (char)0x80, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01
+    );
+    const __m256i ones = _mm256_set1_epi8(1);
+
+    for (; ib < nb; ++ib) {
+        const float d0 = GGML_CPU_FP16_TO_FP32(x[ib].d);
+
+        // Each q1_0_g128 block maps to 4 consecutive q8_0 blocks (4 * 32 = 128 elements).
+        // Process one q8_0 sub-block (32 elements) per iteration.
+        for (int k = 0; k < 4; ++k) {
+            const float d1  = GGML_CPU_FP16_TO_FP32(y[ib*4 + k].d);
+            const __m256 d  = _mm256_set1_ps(d0 * d1);
+
+            // Load the 4 bytes (32 bits) covering elements [k*32 .. k*32+31]
+            const uint32_t qbits32 = *(const uint32_t *)(x[ib].qs + k * 4);
+
+            // Load 32 q8_0 int8 activations
+            const __m256i qy = _mm256_loadu_si256((const __m256i *)y[ib*4 + k].qs);
+
+            // Expand 32 bits → 32 bytes of ±1 using the same shuffle/mask trick as q1_0
+            const __m128i qbits_128   = _mm_set1_epi32(qbits32);
+            const __m256i qbits_256   = _mm256_broadcastsi128_si256(qbits_128);
+            const __m256i qbits_shuf  = _mm256_shuffle_epi8(qbits_256, shuffle_mask);
+            const __m256i bit_test    = _mm256_and_si256(qbits_shuf, bit_mask);
+            const __m256i is_set      = _mm256_cmpeq_epi8(bit_test, bit_mask);
+            const __m256i bit_value   = _mm256_and_si256(is_set, ones);
+            const __m256i bit_doubled = _mm256_add_epi8(bit_value, bit_value);
+            const __m256i qx          = _mm256_sub_epi8(bit_doubled, ones);
+
+            acc = _mm256_fmadd_ps(d, mul_sum_i8_pairs_float(qx, qy), acc);
+        }
+    }
+
+    sumf = hsum_float_8(acc);
+#endif
+
+    // Scalar fallback for any remaining blocks
+    for (; ib < nb; ++ib) {
+        const float d0 = GGML_CPU_FP16_TO_FP32(x[ib].d);
+
+        float sumi = 0.0f;
+
+        for (int k = 0; k < 4; ++k) {
             const float d1 = GGML_CPU_FP16_TO_FP32(y[ib*4 + k].d);
-            
+
             int sumi_block = 0;
-            
+
             for (int j = 0; j < QK8_0; j++) {
-                const int bit_index = k * QK8_0 + j;
+                const int bit_index  = k * QK8_0 + j;
                 const int byte_index = bit_index / 8;
                 const int bit_offset = bit_index % 8;
-                
-                // Extract bit: 1 = +1, 0 = -1
+
                 const int xi = ((x[ib].qs[byte_index] >> bit_offset) & 1) ? 1 : -1;
                 const int yi = y[ib*4 + k].qs[j];
-                
+
                 sumi_block += xi * yi;
             }
-            
+
             sumi += d1 * sumi_block;
         }
-        
+
         sumf += d0 * sumi;
     }
 
