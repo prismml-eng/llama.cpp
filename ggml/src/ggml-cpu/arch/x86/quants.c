@@ -662,41 +662,111 @@ void ggml_vec_dot_q1_0_g128_q8_0(int n, float * GGML_RESTRICT s, size_t bs, cons
     const block_q1_0_g128 * GGML_RESTRICT x = vx;
     const block_q8_0 * GGML_RESTRICT y = vy;
 
-    float sumf = 0;
+    float sumf = 0.0f;
 
-    // Each Q1_0_g128 block has 128 elements
-    // Each Q8_0 block has 32 elements
-    // So we need 4 Q8_0 blocks per Q1_0_g128 block
+#if defined(__AVX2__)
+    // AVX2 vectorized path for Q1_0_g128 dot Q8_0
+    // Uses the same proven bit-expansion pattern as the Q1_0 kernel above.
+    //
+    // Each Q1_0_g128 block has 128 bits = 16 bytes of packed bits.
+    // Each Q8_0 block has 32 int8 values with its own fp16 scale.
+    // We process 4 Q8_0 blocks per Q1_0_g128 block.
+
+    // Constant shuffle mask: replicate each of 4 bytes to 8 positions
+    // Low 128-bit lane: byte0 x8, byte1 x8
+    // High 128-bit lane: byte2 x8, byte3 x8
+    // (AVX2 shuffle_epi8 works within each 128-bit lane independently)
+    const __m256i shuffle_mask = _mm256_set_epi8(
+        3, 3, 3, 3, 3, 3, 3, 3,   // high lane: byte 3 replicated
+        2, 2, 2, 2, 2, 2, 2, 2,   // high lane: byte 2 replicated
+        1, 1, 1, 1, 1, 1, 1, 1,   // low lane: byte 1 replicated
+        0, 0, 0, 0, 0, 0, 0, 0    // low lane: byte 0 replicated
+    );
+
+    // Bit mask: test each bit position within the replicated byte
+    const __m256i bit_mask = _mm256_set_epi8(
+        (char)0x80, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01,
+        (char)0x80, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01,
+        (char)0x80, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01,
+        (char)0x80, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01
+    );
+
+    const __m256i ones = _mm256_set1_epi8(1);
+    __m256 acc = _mm256_setzero_ps();
+
     for (int ib = 0; ib < nb; ++ib) {
         const float d0 = GGML_CPU_FP16_TO_FP32(x[ib].d);
-        
-        int sumi = 0;
-        
+
         // Process 4 Q8_0 blocks (4 * 32 = 128 elements)
         for (int k = 0; k < 4; k++) {
+            const block_q8_0 * GGML_RESTRICT yb = &y[ib * 4 + k];
+
+            // Combined scale for this sub-block
+            const __m256 d = _mm256_set1_ps(d0 * GGML_CPU_FP16_TO_FP32(yb->d));
+
+            // Load 32 int8 values from y
+            const __m256i qy = _mm256_loadu_si256((const __m256i *)yb->qs);
+
+            // Get 4 bytes of bits for this Q8_0 block
+            const uint32_t bits32 = *(const uint32_t *)&x[ib].qs[k * 4];
+
+            // Expand 32 bits to 32 sign bytes (+1/-1)
+            // Same pattern as Q1_0 kernel: broadcast → shuffle → test → convert
+            const __m128i bits_128 = _mm_set1_epi32((int)bits32);
+            const __m256i bits_256 = _mm256_broadcastsi128_si256(bits_128);
+            const __m256i bits_shuffled = _mm256_shuffle_epi8(bits_256, shuffle_mask);
+
+            const __m256i bit_test = _mm256_and_si256(bits_shuffled, bit_mask);
+            const __m256i is_set = _mm256_cmpeq_epi8(bit_test, bit_mask);
+
+            // Convert 0xFF → +1, 0x00 → -1
+            const __m256i bit_value = _mm256_and_si256(is_set, ones);       // 0x01 or 0x00
+            const __m256i bit_doubled = _mm256_add_epi8(bit_value, bit_value); // 0x02 or 0x00
+            const __m256i qx = _mm256_sub_epi8(bit_doubled, ones);          // +1 or -1
+
+            // Dot product of sign bytes * y bytes, result as float
+            const __m256 q = mul_sum_i8_pairs_float(qx, qy);
+
+            // Accumulate with scaling
+            acc = _mm256_fmadd_ps(d, q, acc);
+        }
+    }
+
+    sumf = hsum_float_8(acc);
+    *s = sumf;
+    return;
+
+#else
+    // Scalar fallback with float accumulation (bug-fixed)
+    for (int ib = 0; ib < nb; ++ib) {
+        const float d0 = GGML_CPU_FP16_TO_FP32(x[ib].d);
+
+        float block_sum = 0.0f;  // BUG FIX: was int, must be float
+
+        for (int k = 0; k < 4; k++) {
             const float d1 = GGML_CPU_FP16_TO_FP32(y[ib*4 + k].d);
-            
+
             int sumi_block = 0;
-            
+
             for (int j = 0; j < QK8_0; j++) {
                 const int bit_index = k * QK8_0 + j;
                 const int byte_index = bit_index / 8;
                 const int bit_offset = bit_index % 8;
-                
-                // Extract bit: 1 = +1, 0 = -1
+
                 const int xi = ((x[ib].qs[byte_index] >> bit_offset) & 1) ? 1 : -1;
                 const int yi = y[ib*4 + k].qs[j];
-                
+
                 sumi_block += xi * yi;
             }
-            
-            sumi += d1 * sumi_block;
+
+            block_sum += d1 * (float)sumi_block;  // BUG FIX: float accumulation
         }
-        
-        sumf += d0 * sumi;
+
+        sumf += d0 * block_sum;
     }
 
     *s = sumf;
+#endif
 }
 
 void ggml_vec_dot_q4_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
