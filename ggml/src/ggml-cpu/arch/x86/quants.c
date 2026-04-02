@@ -545,7 +545,117 @@ void ggml_vec_dot_q1_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
 }
 
 void ggml_vec_dot_q1_0_g128_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    const int qk = QK1_0_g128;
+    const int nb = n / qk;
+
+    assert(n % qk == 0);
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    const block_q1_0_g128 * GGML_RESTRICT x = vx;
+    const block_q8_0 * GGML_RESTRICT y = vy;
+
+    float sumf = 0.0f;
+
+#if defined(__AVX512BW__) && defined(__AVX512VL__) && defined(__AVX512VNNI__)
+    // AVX-512 VNNI path: mask registers for bit expansion + VNNI dot product
+    const __m256i ones_u8 = _mm256_set1_epi8(1);
+
+    for (int ib = 0; ib < nb; ++ib) {
+        const float d0 = GGML_CPU_FP16_TO_FP32(x[ib].d);
+
+        for (int k = 0; k < 4; k++) {
+            const float d1 = GGML_CPU_FP16_TO_FP32(y[ib*4 + k].d);
+
+            // Load 32 bits of weights using alias-safe unaligned load
+            uint32_t bmask_u32;
+            memcpy(&bmask_u32, x[ib].qs + k * 4, sizeof(bmask_u32));
+            const __mmask32 bmask = (__mmask32)bmask_u32;
+
+            // Load 32 int8 activations
+            const __m256i q8 = _mm256_loadu_si256((const __m256i *)y[ib*4 + k].qs);
+
+            // Sum ALL q8 values using VNNI (groups of 4 int8 -> int32)
+            const __m256i sum_all = _mm256_dpbusd_epi32(_mm256_setzero_si256(), ones_u8, q8);
+
+            // Zero out q8 where bit=0, keep where bit=1 (single instruction)
+            const __m256i masked_q8 = _mm256_maskz_mov_epi8(bmask, q8);
+
+            // Sum MASKED q8 values using VNNI
+            const __m256i sum_masked = _mm256_dpbusd_epi32(_mm256_setzero_si256(), ones_u8, masked_q8);
+
+            // dot = 2 * sum_masked - sum_all
+            // (weight = 2*bit - 1, so dot = sum((2*bit-1)*q8) = 2*sum(q8 where bit=1) - sum(q8))
+            const __m256i dp = _mm256_sub_epi32(_mm256_slli_epi32(sum_masked, 1), sum_all);
+
+            // Horizontal sum of 8 int32 values
+            const __m128i lo = _mm256_castsi256_si128(dp);
+            const __m128i hi = _mm256_extracti128_si256(dp, 1);
+            __m128i r = _mm_add_epi32(lo, hi);
+            r = _mm_add_epi32(r, _mm_srli_si128(r, 8));
+            r = _mm_add_epi32(r, _mm_srli_si128(r, 4));
+
+            sumf += d0 * d1 * (float)_mm_cvtsi128_si32(r);
+        }
+    }
+
+#elif defined(__AVX2__)
+    // AVX2 path: shuffle-based bit expansion + sign multiply
+    const __m256i shuf   = _mm256_setr_epi8(
+        0,0,0,0,0,0,0,0, 1,1,1,1,1,1,1,1,
+        2,2,2,2,2,2,2,2, 3,3,3,3,3,3,3,3);
+    const __m256i bmask  = _mm256_set1_epi64x(0x8040201008040201LL);
+    const __m256i ones8  = _mm256_set1_epi8(1);
+    const __m256i neg8   = _mm256_set1_epi8(-1);
+    const __m256i ones16 = _mm256_set1_epi16(1);
+
+    for (int ib = 0; ib < nb; ++ib) {
+        const float d0 = GGML_CPU_FP16_TO_FP32(x[ib].d);
+
+        for (int k = 0; k < 4; k++) {
+            const float d1 = GGML_CPU_FP16_TO_FP32(y[ib*4 + k].d);
+
+            // Broadcast 4 bytes of 1-bit weights using alias-safe load
+            int32_t bits_i32;
+            memcpy(&bits_i32, x[ib].qs + k * 4, sizeof(bits_i32));
+            __m256i vb = _mm256_set1_epi32(bits_i32);
+            __m256i ex = _mm256_shuffle_epi8(vb, shuf);
+            ex = _mm256_cmpeq_epi8(_mm256_and_si256(ex, bmask), bmask);
+
+            // Convert mask to +1/-1
+            const __m256i xi = _mm256_blendv_epi8(neg8, ones8, ex);
+
+            // Multiply: sign_epi8(q8, xi) = q8 * sign(xi)
+            const __m256i q8   = _mm256_loadu_si256((const __m256i *)y[ib*4 + k].qs);
+            const __m256i prod = _mm256_sign_epi8(q8, xi);
+
+            // Horizontal sum of 32 int8 -> int32
+            const __m256i p16_lo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(prod));
+            const __m256i p16_hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(prod, 1));
+            const __m256i s32_lo = _mm256_madd_epi16(p16_lo, ones16);
+            const __m256i s32_hi = _mm256_madd_epi16(p16_hi, ones16);
+            const __m256i s32    = _mm256_add_epi32(s32_lo, s32_hi);
+
+            const __m128i lo = _mm256_castsi256_si128(s32);
+            const __m128i hi = _mm256_extracti128_si256(s32, 1);
+            __m128i r = _mm_add_epi32(lo, hi);
+            r = _mm_add_epi32(r, _mm_srli_si128(r, 8));
+            r = _mm_add_epi32(r, _mm_srli_si128(r, 4));
+
+            sumf += d0 * d1 * (float)_mm_cvtsi128_si32(r);
+        }
+    }
+
+#else
+    // Scalar fallback — delegates to generic implementation
     ggml_vec_dot_q1_0_g128_q8_0_generic(n, s, bs, vx, bx, vy, by, nrc);
+    return;
+#endif
+
+    *s = sumf;
 }
 
 void ggml_vec_dot_q4_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {

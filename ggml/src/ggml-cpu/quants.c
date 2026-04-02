@@ -176,35 +176,26 @@ void ggml_vec_dot_q1_0_g128_q8_0_generic(int n, float * GGML_RESTRICT s, size_t 
     const block_q8_0 * GGML_RESTRICT y = vy;
     
     
-    float sumf = 0.0;
-    
-    // Each Q1_0_g128 block has 128 elements, each Q8_0 block has 32 elements
-    // So we need 4 Q8_0 blocks per Q1_0_g128 block
+    float sumf = 0.0f;
+
     for (int i = 0; i < nb; i++) {
         const float d0 = GGML_FP16_TO_FP32(x[i].d);
-        
-        float sumi = 0.0f;
 
         for (int k = 0; k < 4; k++) {
             const float d1 = GGML_FP16_TO_FP32(y[i*4 + k].d);
+            const uint8_t * bits = x[i].qs + k * 4;
+            const int8_t  * q8   = y[i*4 + k].qs;
 
-            int sumi_block = 0;
-
+            int sumi = 0;
             for (int j = 0; j < QK8_0; j++) {
-                const int bit_index = k * QK8_0 + j;
-                const int byte_index = bit_index / 8;
-                const int bit_offset = bit_index % 8;
-
-                const int xi = ((x[i].qs[byte_index] >> bit_offset) & 1) ? 1 : -1;
-                sumi_block += xi * y[i*4 + k].qs[j];
+                const int bit = (bits[j >> 3] >> (j & 7)) & 1;
+                sumi += (2*bit - 1) * q8[j];
             }
 
-            sumi += d1 * sumi_block;
+            sumf += d0 * d1 * (float)sumi;
         }
-
-        sumf += d0 * sumi;
     }
-    
+
     *s = sumf;
 }
 
