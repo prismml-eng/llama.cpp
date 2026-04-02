@@ -65,52 +65,56 @@ static inline int hsum_i32_4(const __m128i a) {
     return _mm_cvtsi128_si32(_mm_add_epi32(sum64, hi32));
 }
 
-#if defined(__AVX2__) || defined(__AVX512F__)
-static inline __m256i mul_add_epi8(const __m256i x, const __m256i y) {
-    const __m256i ax = _mm256_sign_epi8(x, x);
-    const __m256i sy = _mm256_sign_epi8(y, x);
-    return _mm256_maddubs_epi16(ax, sy);
-}
-
-// spread 32 bits to 32 bytes { 0x00, 0xFF }
-static inline __m256i bytes_from_bits_32(const uint8_t * x) {
-    uint32_t x32;
-    memcpy(&x32, x, sizeof(uint32_t));
-    const __m256i shuf_mask = _mm256_set_epi64x(
-            0x0303030303030303, 0x0202020202020202,
-            0x0101010101010101, 0x0000000000000000);
-    __m256i bytes = _mm256_shuffle_epi8(_mm256_set1_epi32(x32), shuf_mask);
-    const __m256i bit_mask = _mm256_set1_epi64x(0x7fbfdfeff7fbfdfe);
-    bytes = _mm256_or_si256(bytes, bit_mask);
-    return _mm256_cmpeq_epi8(bytes, _mm256_set1_epi64x(-1));
-}
-
-// Unpack 32 4-bit fields into 32 bytes
-// The output vector contains 32 bytes, each one in [ 0 .. 15 ] interval
-static inline __m256i bytes_from_nibbles_32(const uint8_t * rsi)
-{
-    const __m128i tmp = _mm_loadu_si128((const __m128i *)rsi);
-    const __m256i bytes = MM256_SET_M128I(_mm_srli_epi16(tmp, 4), tmp);
-    const __m256i lowMask = _mm256_set1_epi8( 0xF );
-    return _mm256_and_si256(lowMask, bytes);
-}
-
-// add int16_t pairwise and return as float vector
-static inline __m256 sum_i16_pairs_float(const __m256i x) {
-    const __m256i ones = _mm256_set1_epi16(1);
-    const __m256i summed_pairs = _mm256_madd_epi16(ones, x);
-    return _mm256_cvtepi32_ps(summed_pairs);
-}
-
-static inline __m256 mul_sum_us8_pairs_float(const __m256i ax, const __m256i sy) {
-#if defined(__AVX512VNNI__) && defined(__AVX512VL__)
+#if defined(__AVX2__)
+    // AVX2: single-pass byte-level processing, fully unrolled k-loop.
+    // Pipeline: broadcast+shuffle -> AND+cmpeq -> XOR+SUB -> maddubs+madd -> cvt+fma
+    const __m256i ones_8  = _mm256_set1_epi8(1);
+    const __m256i ones_16 = _mm256_set1_epi16(1);
+    const __m256i byte_shuf = _mm256_setr_epi8(
+        0,0,0,0,0,0,0,0, 1,1,1,1,1,1,1,1,
+        2,2,2,2,2,2,2,2, 3,3,3,3,3,3,3,3);
+    const __m256i bit_masks = _mm256_setr_epi8(
+        1,2,4,8,16,32,64,-128, 1,2,4,8,16,32,64,-128,
+        1,2,4,8,16,32,64,-128, 1,2,4,8,16,32,64,-128);
     const __m256i zero = _mm256_setzero_si256();
-    const __m256i summed_pairs = _mm256_dpbusd_epi32(zero, ax, sy);
-    return _mm256_cvtepi32_ps(summed_pairs);
-#elif defined(__AVXVNNI__)
-    const __m256i zero = _mm256_setzero_si256();
-    const __m256i summed_pairs = _mm256_dpbusd_avx_epi32(zero, ax, sy);
-    return _mm256_cvtepi32_ps(summed_pairs);
+    __m256 acc = _mm256_setzero_ps();
+
+    for (int ib = 0; ib < nb; ++ib) {
+        const float d0 = GGML_CPU_FP16_TO_FP32(x[ib].d);
+        const uint32_t * qs32 = (const uint32_t *)x[ib].qs;
+
+#define Q1_AVX2_BLOCK(K) \
+        { \
+            const __m256i y = _mm256_loadu_si256((const __m256i *)y_ptr[K].qs); \
+            const __m256i sm = _mm256_cmpeq_epi8(_mm256_and_si256( \
+                _mm256_shuffle_epi8(_mm256_set1_epi32((int)qs32[K]), byte_shuf), \
+                bit_masks), zero); \
+            const __m256i sy = _mm256_sub_epi8(_mm256_xor_si256(y, sm), sm); \
+            const __m256i s32 = _mm256_madd_epi16( \
+                _mm256_maddubs_epi16(ones_8, sy), ones_16); \
+            acc_block = (K == 0) \
+                ? _mm256_mul_ps(_mm256_set1_ps(GGML_CPU_FP16_TO_FP32(y_ptr[K].d)), \
+                                _mm256_cvtepi32_ps(s32)) \
+                : _mm256_fmadd_ps(_mm256_set1_ps(GGML_CPU_FP16_TO_FP32(y_ptr[K].d)), \
+                                   _mm256_cvtepi32_ps(s32), acc_block); \
+        }
+
+        const block_q8_0 * y_ptr = &y[ib*4];
+        __m256 acc_block;
+        Q1_AVX2_BLOCK(0)
+        Q1_AVX2_BLOCK(1)
+        Q1_AVX2_BLOCK(2)
+        Q1_AVX2_BLOCK(3)
+#undef Q1_AVX2_BLOCK
+
+        acc = _mm256_fmadd_ps(_mm256_set1_ps(d0), acc_block, acc);
+    }
+    {
+        const __m128 h = _mm_add_ps(_mm256_extractf128_ps(acc, 0),
+                                     _mm256_extractf128_ps(acc, 1));
+        const __m128 q = _mm_add_ps(h, _mm_movehl_ps(h, h));
+        *s = _mm_cvtss_f32(_mm_add_ss(q, _mm_movehdup_ps(q)));
+    }
 #else
     // Perform multiplication and create 16-bit values
     const __m256i dot = _mm256_maddubs_epi16(ax, sy);
