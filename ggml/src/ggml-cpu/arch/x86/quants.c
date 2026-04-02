@@ -664,9 +664,59 @@ void ggml_vec_dot_q1_0_g128_q8_0(int n, float * GGML_RESTRICT s, size_t bs, cons
 
     float sumf = 0;
 
-    // Each Q1_0_g128 block has 128 elements
-    // Each Q8_0 block has 32 elements
-    // So we need 4 Q8_0 blocks per Q1_0_g128 block
+#if defined(__AVX2__)
+    // AVX2: process 32 Q8_0 values per sub-block in two 16-element passes.
+    // Sign-extend int8->int16, expand 1-bit weights to masks, blend to negate,
+    // then madd->fma accumulation.
+    const __m256i ones_16 = _mm256_set1_epi16(1);
+    const __m256i bmask = _mm256_setr_epi16(
+        1<<0,  1<<1,  1<<2,  1<<3,  1<<4,  1<<5,  1<<6,  1<<7,
+        1<<8,  1<<9,  1<<10, 1<<11, 1<<12, 1<<13, 1<<14, (short)(1<<15));
+    __m256 acc = _mm256_setzero_ps();
+
+    for (int ib = 0; ib < nb; ++ib) {
+        const float d0 = GGML_CPU_FP16_TO_FP32(x[ib].d);
+        __m256 acc_block = _mm256_setzero_ps();
+
+        for (int k = 0; k < 4; k++) {
+            const float d1 = GGML_CPU_FP16_TO_FP32(y[ib*4 + k].d);
+            const __m256i y_bytes = _mm256_loadu_si256((const __m256i *)y[ib*4 + k].qs);
+
+            uint32_t bits;
+            memcpy(&bits, &x[ib].qs[k * 4], sizeof(bits));
+
+            // Lower 16 elements: sign-extend int8->int16, apply sign from weight bits
+            const __m256i y_lo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(y_bytes));
+            const __m256i neg_lo = _mm256_sub_epi16(_mm256_setzero_si256(), y_lo);
+            const __m256i mask_lo = _mm256_cmpeq_epi16(
+                _mm256_and_si256(_mm256_set1_epi16((short)(bits & 0xFFFF)), bmask), bmask);
+            const __m256i signed_lo = _mm256_blendv_epi8(neg_lo, y_lo, mask_lo);
+
+            // Upper 16 elements
+            const __m256i y_hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(y_bytes, 1));
+            const __m256i neg_hi = _mm256_sub_epi16(_mm256_setzero_si256(), y_hi);
+            const __m256i mask_hi = _mm256_cmpeq_epi16(
+                _mm256_and_si256(_mm256_set1_epi16((short)(bits >> 16)), bmask), bmask);
+            const __m256i signed_hi = _mm256_blendv_epi8(neg_hi, y_hi, mask_hi);
+
+            // Pair-wise sum int16->int32, combine halves, convert to float, FMA
+            const __m256i sum_32 = _mm256_add_epi32(
+                _mm256_madd_epi16(signed_lo, ones_16),
+                _mm256_madd_epi16(signed_hi, ones_16));
+            acc_block = _mm256_fmadd_ps(_mm256_set1_ps(d1),
+                                         _mm256_cvtepi32_ps(sum_32), acc_block);
+        }
+        acc = _mm256_fmadd_ps(_mm256_set1_ps(d0), acc_block, acc);
+    }
+    // Horizontal reduction: 256 -> 128 -> scalar
+    {
+        const __m128 h = _mm_add_ps(_mm256_extractf128_ps(acc, 0),
+                                     _mm256_extractf128_ps(acc, 1));
+        const __m128 q = _mm_add_ps(h, _mm_movehl_ps(h, h));
+        *s = _mm_cvtss_f32(_mm_add_ss(q, _mm_movehdup_ps(q)));
+    }
+#else
+    // Scalar fallback
     for (int ib = 0; ib < nb; ++ib) {
         const float d0 = GGML_CPU_FP16_TO_FP32(x[ib].d);
         
@@ -697,6 +747,7 @@ void ggml_vec_dot_q1_0_g128_q8_0(int n, float * GGML_RESTRICT s, size_t bs, cons
     }
 
     *s = sumf;
+#endif
 }
 
 void ggml_vec_dot_q4_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
