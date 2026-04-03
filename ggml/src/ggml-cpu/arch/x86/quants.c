@@ -562,14 +562,14 @@ void ggml_vec_dot_q1_0_g128_q8_0(int n, float * GGML_RESTRICT s, size_t bs, cons
 
 #if defined(__AVX512BW__) && defined(__AVX512VL__) && defined(__AVX512VNNI__)
     // AVX-512 VNNI path: mask registers for bit expansion + VNNI dot product
+    // Accumulate into float vector, single hsum at the end
     const __m256i ones_u8 = _mm256_set1_epi8(1);
+    __m256 acc = _mm256_setzero_ps();
 
     for (int ib = 0; ib < nb; ++ib) {
         const float d0 = GGML_CPU_FP16_TO_FP32(x[ib].d);
 
         for (int k = 0; k < 4; k++) {
-            const float d1 = GGML_CPU_FP16_TO_FP32(y[ib*4 + k].d);
-
             // Load 32 bits of weights using alias-safe unaligned load
             uint32_t bmask_u32;
             memcpy(&bmask_u32, x[ib].qs + k * 4, sizeof(bmask_u32));
@@ -591,32 +591,32 @@ void ggml_vec_dot_q1_0_g128_q8_0(int n, float * GGML_RESTRICT s, size_t bs, cons
             // (weight = 2*bit - 1, so dot = sum((2*bit-1)*q8) = 2*sum(q8 where bit=1) - sum(q8))
             const __m256i dp = _mm256_sub_epi32(_mm256_slli_epi32(sum_masked, 1), sum_all);
 
-            // Horizontal sum of 8 int32 values
-            const __m128i lo = _mm256_castsi256_si128(dp);
-            const __m128i hi = _mm256_extracti128_si256(dp, 1);
-            __m128i r = _mm_add_epi32(lo, hi);
-            r = _mm_add_epi32(r, _mm_srli_si128(r, 8));
-            r = _mm_add_epi32(r, _mm_srli_si128(r, 4));
-
-            sumf += d0 * d1 * (float)_mm_cvtsi128_si32(r);
+            // Scale by d1 and accumulate into float accumulator
+            const float d1 = GGML_CPU_FP16_TO_FP32(y[ib*4 + k].d);
+            acc = _mm256_fmadd_ps(_mm256_set1_ps(d0 * d1), _mm256_cvtepi32_ps(dp), acc);
         }
     }
 
+    sumf = hsum_float_8(acc);
+
 #elif defined(__AVX2__)
-    // AVX2 path: shuffle-based bit expansion + sign multiply
-    const __m256i shuf   = _mm256_setr_epi8(
+    // AVX2 path: shuffle-based bit expansion + mul_sum_i8_pairs_float
+    // Uses llama.cpp's optimized helper (auto-selects AVXVNNI dpbssd when available)
+    const __m256i shuf  = _mm256_setr_epi8(
         0,0,0,0,0,0,0,0, 1,1,1,1,1,1,1,1,
         2,2,2,2,2,2,2,2, 3,3,3,3,3,3,3,3);
-    const __m256i bmask  = _mm256_set1_epi64x(0x8040201008040201LL);
-    const __m256i ones8  = _mm256_set1_epi8(1);
-    const __m256i neg8   = _mm256_set1_epi8(-1);
-    const __m256i ones16 = _mm256_set1_epi16(1);
+    const __m256i bmask = _mm256_set1_epi64x(0x8040201008040201LL);
+    const __m256i ones8 = _mm256_set1_epi8(1);
+    const __m256i neg8  = _mm256_set1_epi8(-1);
+
+    __m256 acc = _mm256_setzero_ps();
 
     for (int ib = 0; ib < nb; ++ib) {
         const float d0 = GGML_CPU_FP16_TO_FP32(x[ib].d);
 
         for (int k = 0; k < 4; k++) {
             const float d1 = GGML_CPU_FP16_TO_FP32(y[ib*4 + k].d);
+            const __m256 d_scale = _mm256_set1_ps(d0 * d1);
 
             // Broadcast 4 bytes of 1-bit weights using alias-safe load
             int32_t bits_i32;
@@ -628,26 +628,19 @@ void ggml_vec_dot_q1_0_g128_q8_0(int n, float * GGML_RESTRICT s, size_t bs, cons
             // Convert mask to +1/-1
             const __m256i xi = _mm256_blendv_epi8(neg8, ones8, ex);
 
-            // Multiply: sign_epi8(q8, xi) = q8 * sign(xi)
-            const __m256i q8   = _mm256_loadu_si256((const __m256i *)y[ib*4 + k].qs);
-            const __m256i prod = _mm256_sign_epi8(q8, xi);
+            // Load 32 int8 activations
+            const __m256i q8 = _mm256_loadu_si256((const __m256i *)y[ib*4 + k].qs);
 
-            // Horizontal sum of 32 int8 -> int32
-            const __m256i p16_lo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(prod));
-            const __m256i p16_hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(prod, 1));
-            const __m256i s32_lo = _mm256_madd_epi16(p16_lo, ones16);
-            const __m256i s32_hi = _mm256_madd_epi16(p16_hi, ones16);
-            const __m256i s32    = _mm256_add_epi32(s32_lo, s32_hi);
+            // Dot product + float conversion via optimized helper
+            // (auto-uses AVXVNNI dpbssd on supported CPUs)
+            const __m256 p = mul_sum_i8_pairs_float(xi, q8);
 
-            const __m128i lo = _mm256_castsi256_si128(s32);
-            const __m128i hi = _mm256_extracti128_si256(s32, 1);
-            __m128i r = _mm_add_epi32(lo, hi);
-            r = _mm_add_epi32(r, _mm_srli_si128(r, 8));
-            r = _mm_add_epi32(r, _mm_srli_si128(r, 4));
-
-            sumf += d0 * d1 * (float)_mm_cvtsi128_si32(r);
+            // Accumulate scaled result
+            acc = _mm256_fmadd_ps(d_scale, p, acc);
         }
     }
+
+    sumf = hsum_float_8(acc);
 
 #else
     // Scalar fallback — delegates to generic implementation
