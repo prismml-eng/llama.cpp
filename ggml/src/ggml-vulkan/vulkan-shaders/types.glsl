@@ -5,6 +5,7 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_8bit_storage : require
 #extension GL_EXT_shader_16bit_storage : require
 
 #if defined(DATA_A_F32)
@@ -46,6 +47,7 @@
 #endif
 #endif
 
+#define QUANT_K_Q1_0 128#define QUANT_R_Q1_0 1struct block_q1_0{    float16_t d;    uint8_t qs[16];};#if defined(DATA_A_Q1_0)#define QUANT_K QUANT_K_Q1_0#define QUANT_R QUANT_R_Q1_0#define QUANT_AUXF 1#define A_TYPE block_q1_0#define DATA_A_QUANT_LEGACY#endif
 #define QUANT_K_Q4_0 32
 #define QUANT_R_Q4_0 2
 

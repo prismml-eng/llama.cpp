@@ -1,0 +1,108 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_shader_8bit_storage : require
+
+#include "mul_mat_vec_base.glsl"
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+// Fused 1-bit matrix-vector multiply for Q1_0.
+// 4 threads per block, each handles 32 elements (one uint32 of packed bits).
+// Uses simple ternary sign selection which compiles to v_cndmask on RDNA.
+
+FLOAT_TYPE temp[NUM_COLS][NUM_ROWS];
+
+void calc_block(const uint a_offset, const uint b_offset, const uint itid, const uint i,
+                const uint num_blocks_per_row, const uint first_row, const uint num_rows) {
+
+    const uint y_idx_base = i * 128 + itid * 32;
+
+    [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+        const uint base_b = (j * p.batch_stride_b + b_offset + y_idx_base) / 4;
+        const vec4 bv0 = vec4(data_b_v4[base_b]);
+        const vec4 bv1 = vec4(data_b_v4[base_b + 1]);
+        const vec4 bv2 = vec4(data_b_v4[base_b + 2]);
+        const vec4 bv3 = vec4(data_b_v4[base_b + 3]);
+        const vec4 bv4 = vec4(data_b_v4[base_b + 4]);
+        const vec4 bv5 = vec4(data_b_v4[base_b + 5]);
+        const vec4 bv6 = vec4(data_b_v4[base_b + 6]);
+        const vec4 bv7 = vec4(data_b_v4[base_b + 7]);
+
+        uint ibi = a_offset + first_row * num_blocks_per_row + i;
+
+        [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+            const float d = float(data_a[ibi].d);
+
+            const uint byte_base = itid * 4;
+            const uint bits = uint(data_a[ibi].qs[byte_base])
+                            | (uint(data_a[ibi].qs[byte_base + 1]) << 8)
+                            | (uint(data_a[ibi].qs[byte_base + 2]) << 16)
+                            | (uint(data_a[ibi].qs[byte_base + 3]) << 24);
+
+            FLOAT_TYPE partial = FLOAT_TYPE(0);
+
+            partial += FLOAT_TYPE(dot(vec4(
+                (bits & 0x1u) != 0 ? 1.0 : -1.0, (bits & 0x2u) != 0 ? 1.0 : -1.0,
+                (bits & 0x4u) != 0 ? 1.0 : -1.0, (bits & 0x8u) != 0 ? 1.0 : -1.0), bv0));
+            partial += FLOAT_TYPE(dot(vec4(
+                (bits & 0x10u) != 0 ? 1.0 : -1.0, (bits & 0x20u) != 0 ? 1.0 : -1.0,
+                (bits & 0x40u) != 0 ? 1.0 : -1.0, (bits & 0x80u) != 0 ? 1.0 : -1.0), bv1));
+            partial += FLOAT_TYPE(dot(vec4(
+                (bits & 0x100u) != 0 ? 1.0 : -1.0, (bits & 0x200u) != 0 ? 1.0 : -1.0,
+                (bits & 0x400u) != 0 ? 1.0 : -1.0, (bits & 0x800u) != 0 ? 1.0 : -1.0), bv2));
+            partial += FLOAT_TYPE(dot(vec4(
+                (bits & 0x1000u) != 0 ? 1.0 : -1.0, (bits & 0x2000u) != 0 ? 1.0 : -1.0,
+                (bits & 0x4000u) != 0 ? 1.0 : -1.0, (bits & 0x8000u) != 0 ? 1.0 : -1.0), bv3));
+            partial += FLOAT_TYPE(dot(vec4(
+                (bits & 0x10000u) != 0 ? 1.0 : -1.0, (bits & 0x20000u) != 0 ? 1.0 : -1.0,
+                (bits & 0x40000u) != 0 ? 1.0 : -1.0, (bits & 0x80000u) != 0 ? 1.0 : -1.0), bv4));
+            partial += FLOAT_TYPE(dot(vec4(
+                (bits & 0x100000u) != 0 ? 1.0 : -1.0, (bits & 0x200000u) != 0 ? 1.0 : -1.0,
+                (bits & 0x400000u) != 0 ? 1.0 : -1.0, (bits & 0x800000u) != 0 ? 1.0 : -1.0), bv5));
+            partial += FLOAT_TYPE(dot(vec4(
+                (bits & 0x1000000u) != 0 ? 1.0 : -1.0, (bits & 0x2000000u) != 0 ? 1.0 : -1.0,
+                (bits & 0x4000000u) != 0 ? 1.0 : -1.0, (bits & 0x8000000u) != 0 ? 1.0 : -1.0), bv6));
+            partial += FLOAT_TYPE(dot(vec4(
+                (bits & 0x10000000u) != 0 ? 1.0 : -1.0, (bits & 0x20000000u) != 0 ? 1.0 : -1.0,
+                (bits & 0x40000000u) != 0 ? 1.0 : -1.0, (bits & 0x80000000u) != 0 ? 1.0 : -1.0), bv7));
+
+            temp[j][n] = fma(FLOAT_TYPE(d), partial, temp[j][n]);
+            ibi += num_blocks_per_row;
+        }
+    }
+}
+
+void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
+    uint a_offset, b_offset, d_offset;
+    get_offsets(a_offset, b_offset, d_offset);
+
+    const uint num_blocks_per_row = p.ncols / 128;
+    const uint blocks_per_wg = gl_WorkGroupSize.x / 4;
+    const uint tid = gl_LocalInvocationID.x;
+    const uint itid = tid % 4;
+    const uint ix = tid / 4;
+
+    [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+        [[unroll]] for (uint i = 0; i < NUM_ROWS; ++i) {
+            temp[j][i] = FLOAT_TYPE(0);
+        }
+    }
+
+    [[unroll]] for (uint i = ix; i < num_blocks_per_row; i += blocks_per_wg)
+        calc_block(a_offset, b_offset, itid, i, num_blocks_per_row, first_row, num_rows);
+
+    reduce_result(temp, d_offset, first_row, num_rows, tid);
+}
+
+void main() {
+    const uint first_row = NUM_ROWS * (gl_WorkGroupID.x + gl_NumWorkGroups.x * gl_WorkGroupID.z);
+
+    if (first_row + NUM_ROWS <= p.stride_d) {
+        compute_outputs(first_row, NUM_ROWS);
+    } else {
+        if (first_row >= p.stride_d) {
+            return;
+        }
+        compute_outputs(first_row, p.stride_d - first_row);
+    }
+}

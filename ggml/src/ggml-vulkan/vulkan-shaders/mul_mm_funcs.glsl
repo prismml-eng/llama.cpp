@@ -130,6 +130,36 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
 
             buf_a[buf_idx    ] = FLOAT_TYPE_VEC2(v.xy);
             buf_a[buf_idx + 1] = FLOAT_TYPE_VEC2(v.zw);
+#elif defined(DATA_A_Q1_0)
+            const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
+            const uint buf_idx = col * SHMEM_STRIDE + row * LOAD_VEC_A / 2;
+
+            // LOAD_VEC_A = 4, so each load processes 4 elements.
+            // 128 elements per block / 4 = 32 loads per block.
+            const uint ib = idx / 32;   // block index
+            const uint iel = (idx % 32) * 4;  // element offset within block (0,4,8,...124)
+
+            const float d = float(data_a[ib].d);
+            const float d2 = d + d;
+            const float neg_d = -d;
+
+            // Decode the containing 16-bit chunk, then select the 4-bit sub-group for this load.
+            const uint chunk16 = iel / 16;
+            const uint chunk_bit = iel % 16;
+            const uint byte_offset = chunk16 * 2;
+            const uint bits16 = uint(data_a[ib].qs[byte_offset])
+                              | (uint(data_a[ib].qs[byte_offset + 1]) << 8);
+            const uint bits = (bits16 >> chunk_bit) & 0xFu;
+
+            // Branchless FMA: d*(2*bit-1) = fma(2d, bit_float, -d)
+            const vec4 bit_floats = vec4(
+                float(bits & 1u), float((bits >> 1) & 1u),
+                float((bits >> 2) & 1u), float((bits >> 3) & 1u)
+            );
+            const vec4 v = fma(vec4(d2), bit_floats, vec4(neg_d));
+
+            buf_a[buf_idx    ] = FLOAT_TYPE_VEC2(v.xy);
+            buf_a[buf_idx + 1] = FLOAT_TYPE_VEC2(v.zw);
 #elif defined(DATA_A_Q2_K)
             const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
             const uint buf_idx = col * SHMEM_STRIDE + row * LOAD_VEC_A / 2;

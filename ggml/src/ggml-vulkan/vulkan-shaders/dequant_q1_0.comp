@@ -1,0 +1,29 @@
+#version 450
+
+#include "dequant_head.glsl"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer A {block_q1_0 data_a[];};
+layout (binding = 1) writeonly buffer D {D_TYPE data_b[];};
+
+void main() {
+    // Each thread handles one 128-element block
+    const uint ib = gl_WorkGroupID.x * 256 + gl_LocalInvocationID.x;
+
+    if (ib >= p.nel / 128) {
+        return;
+    }
+
+    const uint b_idx = ib * 128;
+    const float d = float(data_a[ib].d);
+
+    // Each block has 16 bytes = 128 bits = 128 elements
+    [[unroll]] for (uint byte_idx = 0; byte_idx < 16; ++byte_idx) {
+        const uint bits = uint(data_a[ib].qs[byte_idx]);
+        [[unroll]] for (uint bit_idx = 0; bit_idx < 8; ++bit_idx) {
+            const float sign = ((bits >> bit_idx) & 1) == 1 ? 1.0f : -1.0f;
+            data_b[b_idx + byte_idx * 8 + bit_idx] = D_TYPE(d * sign);
+        }
+    }
+}
