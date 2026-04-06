@@ -685,9 +685,10 @@ void ggml_vec_dot_q1_0_g128_q8_0(int n, float * GGML_RESTRICT s, size_t bs, cons
         const float d0 = GGML_CPU_FP16_TO_FP32(x[ib].d);
 
         for (int k = 0; k < 4; ++k) {
-            const float   d1       = GGML_CPU_FP16_TO_FP32(y[ib*4 + k].d);
-            const uint32_t qbits32 = *(const uint32_t *)(x[ib].qs + k * 4);
-            const __m256i  qy      = _mm256_loadu_si256((const __m256i *)y[ib*4 + k].qs);
+            const float d1 = GGML_CPU_FP16_TO_FP32(y[ib*4 + k].d);
+            uint32_t qbits32;
+            memcpy(&qbits32, x[ib].qs + k * 4, sizeof(qbits32));
+            const __m256i qy = _mm256_loadu_si256((const __m256i *)y[ib*4 + k].qs);
 
             // Negate qy where bit=0 (weight=-1), keep qy where bit=1 (weight=+1)
             const __m256i neg_qy    = _mm256_sub_epi8(zero_256, qy);
@@ -730,7 +731,8 @@ void ggml_vec_dot_q1_0_g128_q8_0(int n, float * GGML_RESTRICT s, size_t bs, cons
             const __m256 d  = _mm256_set1_ps(d0 * d1);
 
             // Load the 4 bytes (32 bits) covering elements [k*32 .. k*32+31]
-            const uint32_t qbits32 = *(const uint32_t *)(x[ib].qs + k * 4);
+            uint32_t qbits32;
+            memcpy(&qbits32, x[ib].qs + k * 4, sizeof(qbits32));
 
             // Load 32 q8_0 int8 activations
             const __m256i qy = _mm256_loadu_si256((const __m256i *)y[ib*4 + k].qs);

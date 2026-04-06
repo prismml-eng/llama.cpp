@@ -292,12 +292,13 @@ Instructions for adding support for new models: [HOWTO-add-model.md](docs/develo
 
 ## AMD GPU support (ROCm/HIP)
 
-This branch supports running Bonsai Q1_0_g128 models on AMD GPUs via ROCm/HIP. The Q1_0_g128 CUDA kernels are compiled transparently by the HIP toolchain — no separate HIP-specific kernel code is needed.
+The HIP backend supports running Bonsai Q1_0_g128 models on AMD GPUs via ROCm/HIP. The Q1_0_g128 CUDA kernels are compiled transparently by the HIP toolchain — no separate HIP-specific kernel code is needed.
 
 ### Requirements
 
-- ROCm 7.x with hipBLAS and rocBLAS (including device libraries for your GPU target)
-- The easiest way to get a fully configured environment is to use the `rocm/pytorch:rocm7.2_ubuntu24.04_py3.12_pytorch_release_2.10.0` Docker image, which includes gfx1151 (Radeon 8060S / Ryzen AI MAX+) support
+- ROCm 6.x+ with hipBLAS and rocBLAS (including device libraries for your GPU target). See [docs/build.md](docs/build.md#hip) for the current HIP/ROCm build requirements.
+- **Note for RDNA4 GPUs (gfx1151, Radeon 8060S / Ryzen AI MAX+):** rocBLAS kernels for gfx1151 first appear in ROCm 7.2. Earlier ROCm versions can build but will fall back to slower generic kernels.
+- The easiest way to get a fully configured environment is to use the `rocm/pytorch:rocm7.2_ubuntu24.04_py3.12_pytorch_release_2.10.0` Docker image, which includes gfx1151 support
 
 ### Build
 
@@ -330,7 +331,7 @@ If your system ROCm installation is partial, build and run inside the Docker ima
 
 ```bash
 docker run --rm \
-  --device /dev/kfd --device /dev/dri/card1 --device /dev/dri/renderD128 \
+  --device /dev/kfd --device /dev/dri \
   --group-add video --group-add render \
   -v /path/to/llama.cpp:/llama.cpp \
   -v /path/to/models:/models \
