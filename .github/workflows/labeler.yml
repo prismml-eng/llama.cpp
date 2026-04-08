@@ -10,8 +10,6 @@ jobs:
     runs-on: ubuntu-slim
     steps:
     - uses: actions/checkout@v6
-      with:
-        repository: "ggml-org/llama.cpp"
     - uses: actions/labeler@v6
       with:
         configuration-path: '.github/labeler.yml'
