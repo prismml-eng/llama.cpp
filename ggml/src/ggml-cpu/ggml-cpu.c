@@ -1241,20 +1241,20 @@ static void ggml_compute_forward_mul_mat_one_chunk(
                     if (i11 + 4 <= ne11 && ir1 + 2 < ir1_end && ir1 + 2 < iir1 + blck_1) {
                         for (int64_t ir0 = iir0; ir0 < ir0_block_end; ) {
                             if (ir0 + 4 <= ir0_block_end) {
-                                ggml_vec_dot_q1_0_q8_0_4x4(ne00, &tmp[ir0 - iir0], 16, src0_row + ir0 * nb01, nb01, src1_col, src1_col_stride);
+                                ggml_vec_dot_q1_0_q8_0_4x4(ne00, &tmp[ir0 - iir0], blck_0, src0_row + ir0 * nb01, nb01, src1_col, src1_col_stride);
                                 ir0 += 4;
                                 continue;
                             }
 
                             vec_dot(ne00, &tmp[ir0 - iir0], 0, src0_row + ir0 * nb01, 0, src1_col, 0, 1);
-                            vec_dot(ne00, &tmp[16 + ir0 - iir0], 0, src0_row + ir0 * nb01, 0, src1_col + src1_col_stride, 0, 1);
-                            vec_dot(ne00, &tmp[32 + ir0 - iir0], 0, src0_row + ir0 * nb01, 0, src1_col + 2 * src1_col_stride, 0, 1);
-                            vec_dot(ne00, &tmp[48 + ir0 - iir0], 0, src0_row + ir0 * nb01, 0, src1_col + 3 * src1_col_stride, 0, 1);
+                            vec_dot(ne00, &tmp[blck_0 + ir0 - iir0], 0, src0_row + ir0 * nb01, 0, src1_col + src1_col_stride, 0, 1);
+                            vec_dot(ne00, &tmp[2*blck_0 + ir0 - iir0], 0, src0_row + ir0 * nb01, 0, src1_col + 2 * src1_col_stride, 0, 1);
+                            vec_dot(ne00, &tmp[3*blck_0 + ir0 - iir0], 0, src0_row + ir0 * nb01, 0, src1_col + 3 * src1_col_stride, 0, 1);
                             ++ir0;
                         }
 
                         for (int cn = 0; cn < 4; ++cn) {
-                            memcpy(&dst_col[iir0 + cn * nb1 / nb0], tmp + (cn * 16), (ir0_block_end - iir0) * sizeof(float));
+                            memcpy(&dst_col[iir0 + cn * nb1 / nb0], tmp + (cn * blck_0), (ir0_block_end - iir0) * sizeof(float));
                         }
 
                         ir1 += 2;
@@ -1263,13 +1263,13 @@ static void ggml_compute_forward_mul_mat_one_chunk(
 #endif
                     for (int64_t ir0 = iir0; ir0 < ir0_block_end; ) {
                         if (ir0 + 4 <= ir0_block_end) {
-                            ggml_vec_dot_q1_0_q8_0_4x2(ne00, &tmp[ir0 - iir0], 16, src0_row + ir0 * nb01, nb01, src1_col, src1_col_stride);
+                            ggml_vec_dot_q1_0_q8_0_4x2(ne00, &tmp[ir0 - iir0], blck_0, src0_row + ir0 * nb01, nb01, src1_col, src1_col_stride);
                             ir0 += 4;
                             continue;
                         }
 
                         vec_dot(ne00, &tmp[ir0 - iir0], 0, src0_row + ir0 * nb01, 0, src1_col, 0, 1);
-                        vec_dot(ne00, &tmp[16 + ir0 - iir0], 0, src0_row + ir0 * nb01, 0, src1_col + src1_col_stride, 0, 1);
+                        vec_dot(ne00, &tmp[blck_0 + ir0 - iir0], 0, src0_row + ir0 * nb01, 0, src1_col + src1_col_stride, 0, 1);
                         ++ir0;
                     }
                 }
@@ -1278,7 +1278,7 @@ static void ggml_compute_forward_mul_mat_one_chunk(
 
                     for (int64_t ir0 = iir0; ir0 < ir0_block_end; ) {
                         if (ir0 + 2 <= ir0_block_end) {
-                            ggml_vec_dot_q1_0_q8_0_2x1(ne00, &tmp[ir0 - iir0], 16, src0_row + ir0 * nb01, nb01, src1_col);
+                            ggml_vec_dot_q1_0_q8_0_2x1(ne00, &tmp[ir0 - iir0], blck_0, src0_row + ir0 * nb01, nb01, src1_col);
                             ir0 += 2;
                             continue;
                         }
@@ -1290,11 +1290,11 @@ static void ggml_compute_forward_mul_mat_one_chunk(
                 else
 #endif
                 for (int64_t ir0 = iir0; ir0 < iir0 + blck_0 && ir0 < ir0_end; ir0 += num_rows_per_vec_dot) {
-                    vec_dot(ne00, &tmp[ir0 - iir0], (num_rows_per_vec_dot > 1 ? 16 : 0), src0_row + ir0 * nb01, (num_rows_per_vec_dot > 1 ? nb01 : 0), src1_col, (num_rows_per_vec_dot > 1 ? src1_col_stride : 0), num_rows_per_vec_dot);
+                    vec_dot(ne00, &tmp[ir0 - iir0], (num_rows_per_vec_dot > 1 ? blck_0 : 0), src0_row + ir0 * nb01, (num_rows_per_vec_dot > 1 ? nb01 : 0), src1_col, (num_rows_per_vec_dot > 1 ? src1_col_stride : 0), num_rows_per_vec_dot);
                 }
 
                 for (int cn = 0; cn < num_rows_per_vec_dot; ++cn) {
-                    memcpy(&dst_col[iir0 + cn * nb1 / nb0], tmp + (cn * 16), (MIN(iir0 + blck_0, ir0_end) - iir0) * sizeof(float));
+                    memcpy(&dst_col[iir0 + cn * nb1 / nb0], tmp + (cn * blck_0), (MIN(iir0 + blck_0, ir0_end) - iir0) * sizeof(float));
                 }
             }
         }
