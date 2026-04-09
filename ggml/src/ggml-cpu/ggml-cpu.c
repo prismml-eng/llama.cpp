@@ -1190,14 +1190,17 @@ static void ggml_compute_forward_mul_mat_one_chunk(
     assert(ne13 % ne03 == 0);
 
     // block-tiling attempt
-    const int64_t blck_0 = 16;
+    // Q1_0 weights are much smaller than their Q8_0 dot operand, so a wider row tile
+    // improves src1_col reuse without increasing the simultaneously hot column set.
+    const int64_t blck_0 = type == GGML_TYPE_Q1_0 ? 32 : 16;
     const int64_t blck_1 = 16;
 
     const size_t src1_col_stride = src1_cont || src1->type != vec_dot_type ? row_size : nb11;
 
     // attempt to reduce false-sharing (does not seem to make a difference)
-    // 16 * 2, accounting for mmla kernels
-    float tmp[32];
+    // Q1_0 uses at most a 32x2 rectangular tile here.
+    float tmp[64];
+    GGML_ASSERT(blck_0 * num_rows_per_vec_dot <= (int64_t) (sizeof(tmp) / sizeof(tmp[0])));
 
     for (int64_t iir1 = ir1_start; iir1 < ir1_end; iir1 += blck_1) {
         for (int64_t iir0 = ir0_start; iir0 < ir0_end; iir0 += blck_0) {
