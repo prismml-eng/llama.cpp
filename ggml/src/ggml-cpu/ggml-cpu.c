@@ -1198,8 +1198,8 @@ static void ggml_compute_forward_mul_mat_one_chunk(
     const size_t src1_col_stride = src1_cont || src1->type != vec_dot_type ? row_size : nb11;
 
     // attempt to reduce false-sharing (does not seem to make a difference)
-    // Q1_0 uses at most a 32x2 rectangular tile here.
-    float tmp[64];
+    // Q1_0 may use up to a 32x4 rectangular tile for AVX-512-only experiments.
+    float tmp[128];
     GGML_ASSERT(blck_0 * num_rows_per_vec_dot <= (int64_t) (sizeof(tmp) / sizeof(tmp[0])));
 
     for (int64_t iir1 = ir1_start; iir1 < ir1_end; iir1 += blck_1) {
@@ -1237,6 +1237,30 @@ static void ggml_compute_forward_mul_mat_one_chunk(
                 if (type == GGML_TYPE_Q1_0 && num_rows_per_vec_dot == 2) {
                     const int64_t ir0_block_end = MIN(iir0 + blck_0, ir0_end);
 
+#if defined(__AVX512F__)
+                    if (i11 + 4 <= ne11 && ir1 + 2 < ir1_end && ir1 + 2 < iir1 + blck_1) {
+                        for (int64_t ir0 = iir0; ir0 < ir0_block_end; ) {
+                            if (ir0 + 4 <= ir0_block_end) {
+                                ggml_vec_dot_q1_0_q8_0_4x4(ne00, &tmp[ir0 - iir0], 16, src0_row + ir0 * nb01, nb01, src1_col, src1_col_stride);
+                                ir0 += 4;
+                                continue;
+                            }
+
+                            vec_dot(ne00, &tmp[ir0 - iir0], 0, src0_row + ir0 * nb01, 0, src1_col, 0, 1);
+                            vec_dot(ne00, &tmp[16 + ir0 - iir0], 0, src0_row + ir0 * nb01, 0, src1_col + src1_col_stride, 0, 1);
+                            vec_dot(ne00, &tmp[32 + ir0 - iir0], 0, src0_row + ir0 * nb01, 0, src1_col + 2 * src1_col_stride, 0, 1);
+                            vec_dot(ne00, &tmp[48 + ir0 - iir0], 0, src0_row + ir0 * nb01, 0, src1_col + 3 * src1_col_stride, 0, 1);
+                            ++ir0;
+                        }
+
+                        for (int cn = 0; cn < 4; ++cn) {
+                            memcpy(&dst_col[iir0 + cn * nb1 / nb0], tmp + (cn * 16), (ir0_block_end - iir0) * sizeof(float));
+                        }
+
+                        ir1 += 2;
+                        continue;
+                    }
+#endif
                     for (int64_t ir0 = iir0; ir0 < ir0_block_end; ) {
                         if (ir0 + 4 <= ir0_block_end) {
                             ggml_vec_dot_q1_0_q8_0_4x2(ne00, &tmp[ir0 - iir0], 16, src0_row + ir0 * nb01, nb01, src1_col, src1_col_stride);
@@ -1248,7 +1272,8 @@ static void ggml_compute_forward_mul_mat_one_chunk(
                         vec_dot(ne00, &tmp[16 + ir0 - iir0], 0, src0_row + ir0 * nb01, 0, src1_col + src1_col_stride, 0, 1);
                         ++ir0;
                     }
-                } else
+                }
+                else
 #endif
                 for (int64_t ir0 = iir0; ir0 < iir0 + blck_0 && ir0 < ir0_end; ir0 += num_rows_per_vec_dot) {
                     vec_dot(ne00, &tmp[ir0 - iir0], (num_rows_per_vec_dot > 1 ? 16 : 0), src0_row + ir0 * nb01, (num_rows_per_vec_dot > 1 ? nb01 : 0), src1_col, (num_rows_per_vec_dot > 1 ? src1_col_stride : 0), num_rows_per_vec_dot);

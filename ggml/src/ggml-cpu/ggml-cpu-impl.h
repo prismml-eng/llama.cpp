@@ -31,6 +31,7 @@ struct ggml_compute_params {
 
 void ggml_vec_dot_q1_0_q8_0_4x1(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy);
 void ggml_vec_dot_q1_0_q8_0_4x2(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by);
+void ggml_vec_dot_q1_0_q8_0_4x4(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by);
 
 
 #if defined(_MSC_VER)
