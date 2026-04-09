@@ -274,6 +274,12 @@ static inline __m256 quad_mx_delta_float(const uint8_t x0, const float y0, const
 }
 #endif
 #elif defined(__SSSE3__)
+static inline float hsum_float_4(const __m128 x) {
+    __m128 res = _mm_hadd_ps(x, x);
+    res = _mm_hadd_ps(res, res);
+    return _mm_cvtss_f32(res);
+}
+
 static inline __m128i bytes_from_bits_16(const uint8_t * x) {
     uint16_t x16;
     memcpy(&x16, x, sizeof(uint16_t));
@@ -670,14 +676,101 @@ void ggml_vec_dot_q1_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
 
     *s = hsum_float_8(acc);
 #elif defined(__AVX__)
-    UNUSED(nrc);
-    assert(nrc == 1);
-    UNUSED(bx);
-    UNUSED(by);
-    UNUSED(bs);
+    assert((nrc == 2) || (nrc == 1));
     const __m128i ones_8 = _mm_set1_epi8(1);
     const __m128i ones_16 = _mm_set1_epi16(1);
     const __m128i zero = _mm_setzero_si128();
+
+    if (nrc == 2) {
+        const block_q1_0 * GGML_RESTRICT x0 = vx;
+        const block_q1_0 * GGML_RESTRICT x1 = (const block_q1_0 *) ((const uint8_t *) vx + bx);
+        const block_q8_0 * GGML_RESTRICT y0 = vy;
+        const block_q8_0 * GGML_RESTRICT y1 = (const block_q8_0 *) ((const uint8_t *) vy + by);
+
+        __m256 acc_00 = _mm256_setzero_ps();
+        __m256 acc_01 = _mm256_setzero_ps();
+        __m256 acc_10 = _mm256_setzero_ps();
+        __m256 acc_11 = _mm256_setzero_ps();
+
+        for (int ib = 0; ib < nb; ++ib) {
+            const float d00 = GGML_CPU_FP16_TO_FP32(x0[ib].d);
+            const float d10 = GGML_CPU_FP16_TO_FP32(x1[ib].d);
+            const block_q8_0 * GGML_RESTRICT y0_ptr = &y0[ib * 4];
+            const block_q8_0 * GGML_RESTRICT y1_ptr = &y1[ib * 4];
+            __m256 acc_block_00 = _mm256_setzero_ps();
+            __m256 acc_block_01 = _mm256_setzero_ps();
+            __m256 acc_block_10 = _mm256_setzero_ps();
+            __m256 acc_block_11 = _mm256_setzero_ps();
+
+#define Q1_AVX_BLOCK_PAIR(K) \
+            { \
+                const __m256i bit_mask_0 = bytes_from_bits_32(&x0[ib].qs[(K) * 4]); \
+                const __m256i bit_mask_1 = bytes_from_bits_32(&x1[ib].qs[(K) * 4]); \
+                const __m128i bit_mask_00 = _mm256_castsi256_si128(bit_mask_0); \
+                const __m128i bit_mask_01 = _mm256_extractf128_si256(bit_mask_0, 1); \
+                const __m128i bit_mask_10 = _mm256_castsi256_si128(bit_mask_1); \
+                const __m128i bit_mask_11 = _mm256_extractf128_si256(bit_mask_1, 1); \
+                const __m128i qy0_0 = _mm_loadu_si128((const __m128i *) &y0_ptr[(K)].qs[0]); \
+                const __m128i qy0_1 = _mm_loadu_si128((const __m128i *) &y0_ptr[(K)].qs[16]); \
+                const __m128i qy1_0 = _mm_loadu_si128((const __m128i *) &y1_ptr[(K)].qs[0]); \
+                const __m128i qy1_1 = _mm_loadu_si128((const __m128i *) &y1_ptr[(K)].qs[16]); \
+                const __m128i sign_mask_00 = _mm_cmpeq_epi8(bit_mask_00, zero); \
+                const __m128i sign_mask_01 = _mm_cmpeq_epi8(bit_mask_01, zero); \
+                const __m128i sign_mask_10 = _mm_cmpeq_epi8(bit_mask_10, zero); \
+                const __m128i sign_mask_11 = _mm_cmpeq_epi8(bit_mask_11, zero); \
+                const __m128i sy00_0 = _mm_sub_epi8(_mm_xor_si128(qy0_0, sign_mask_00), sign_mask_00); \
+                const __m128i sy00_1 = _mm_sub_epi8(_mm_xor_si128(qy0_1, sign_mask_01), sign_mask_01); \
+                const __m128i sy01_0 = _mm_sub_epi8(_mm_xor_si128(qy1_0, sign_mask_00), sign_mask_00); \
+                const __m128i sy01_1 = _mm_sub_epi8(_mm_xor_si128(qy1_1, sign_mask_01), sign_mask_01); \
+                const __m128i sy10_0 = _mm_sub_epi8(_mm_xor_si128(qy0_0, sign_mask_10), sign_mask_10); \
+                const __m128i sy10_1 = _mm_sub_epi8(_mm_xor_si128(qy0_1, sign_mask_11), sign_mask_11); \
+                const __m128i sy11_0 = _mm_sub_epi8(_mm_xor_si128(qy1_0, sign_mask_10), sign_mask_10); \
+                const __m128i sy11_1 = _mm_sub_epi8(_mm_xor_si128(qy1_1, sign_mask_11), sign_mask_11); \
+                const __m128i sum16_00_0 = _mm_maddubs_epi16(ones_8, sy00_0); \
+                const __m128i sum16_00_1 = _mm_maddubs_epi16(ones_8, sy00_1); \
+                const __m128i sum16_01_0 = _mm_maddubs_epi16(ones_8, sy01_0); \
+                const __m128i sum16_01_1 = _mm_maddubs_epi16(ones_8, sy01_1); \
+                const __m128i sum16_10_0 = _mm_maddubs_epi16(ones_8, sy10_0); \
+                const __m128i sum16_10_1 = _mm_maddubs_epi16(ones_8, sy10_1); \
+                const __m128i sum16_11_0 = _mm_maddubs_epi16(ones_8, sy11_0); \
+                const __m128i sum16_11_1 = _mm_maddubs_epi16(ones_8, sy11_1); \
+                const __m128i sum32_00_0 = _mm_madd_epi16(sum16_00_0, ones_16); \
+                const __m128i sum32_00_1 = _mm_madd_epi16(sum16_00_1, ones_16); \
+                const __m128i sum32_01_0 = _mm_madd_epi16(sum16_01_0, ones_16); \
+                const __m128i sum32_01_1 = _mm_madd_epi16(sum16_01_1, ones_16); \
+                const __m128i sum32_10_0 = _mm_madd_epi16(sum16_10_0, ones_16); \
+                const __m128i sum32_10_1 = _mm_madd_epi16(sum16_10_1, ones_16); \
+                const __m128i sum32_11_0 = _mm_madd_epi16(sum16_11_0, ones_16); \
+                const __m128i sum32_11_1 = _mm_madd_epi16(sum16_11_1, ones_16); \
+                const __m256 q00 = _mm256_cvtepi32_ps(MM256_SET_M128I(sum32_00_1, sum32_00_0)); \
+                const __m256 q01 = _mm256_cvtepi32_ps(MM256_SET_M128I(sum32_01_1, sum32_01_0)); \
+                const __m256 q10 = _mm256_cvtepi32_ps(MM256_SET_M128I(sum32_10_1, sum32_10_0)); \
+                const __m256 q11 = _mm256_cvtepi32_ps(MM256_SET_M128I(sum32_11_1, sum32_11_0)); \
+                acc_block_00 = _mm256_add_ps(acc_block_00, _mm256_mul_ps(_mm256_set1_ps(GGML_CPU_FP16_TO_FP32(y0_ptr[(K)].d)), q00)); \
+                acc_block_01 = _mm256_add_ps(acc_block_01, _mm256_mul_ps(_mm256_set1_ps(GGML_CPU_FP16_TO_FP32(y1_ptr[(K)].d)), q01)); \
+                acc_block_10 = _mm256_add_ps(acc_block_10, _mm256_mul_ps(_mm256_set1_ps(GGML_CPU_FP16_TO_FP32(y0_ptr[(K)].d)), q10)); \
+                acc_block_11 = _mm256_add_ps(acc_block_11, _mm256_mul_ps(_mm256_set1_ps(GGML_CPU_FP16_TO_FP32(y1_ptr[(K)].d)), q11)); \
+            }
+            Q1_AVX_BLOCK_PAIR(0)
+            Q1_AVX_BLOCK_PAIR(1)
+            Q1_AVX_BLOCK_PAIR(2)
+            Q1_AVX_BLOCK_PAIR(3)
+#undef Q1_AVX_BLOCK_PAIR
+
+            acc_00 = _mm256_add_ps(acc_00, _mm256_mul_ps(_mm256_set1_ps(d00), acc_block_00));
+            acc_01 = _mm256_add_ps(acc_01, _mm256_mul_ps(_mm256_set1_ps(d00), acc_block_01));
+            acc_10 = _mm256_add_ps(acc_10, _mm256_mul_ps(_mm256_set1_ps(d10), acc_block_10));
+            acc_11 = _mm256_add_ps(acc_11, _mm256_mul_ps(_mm256_set1_ps(d10), acc_block_11));
+        }
+
+        s[0] = hsum_float_8(acc_00);
+        s[1] = hsum_float_8(acc_10);
+        s[bs] = hsum_float_8(acc_01);
+        s[bs + 1] = hsum_float_8(acc_11);
+        return;
+    }
+
+    assert(nrc == 1);
     __m256 acc = _mm256_setzero_ps();
 
     for (int ib = 0; ib < nb; ++ib) {
@@ -713,14 +806,82 @@ void ggml_vec_dot_q1_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
 
     *s = hsum_float_8(acc);
 #elif defined(__SSSE3__)
-    UNUSED(nrc);
-    assert(nrc == 1);
-    UNUSED(bx);
-    UNUSED(by);
-    UNUSED(bs);
+    assert((nrc == 2) || (nrc == 1));
     const __m128i ones_8 = _mm_set1_epi8(1);
     const __m128i ones_16 = _mm_set1_epi16(1);
     const __m128i zero = _mm_setzero_si128();
+
+    if (nrc == 2) {
+        const block_q1_0 * GGML_RESTRICT x0 = vx;
+        const block_q1_0 * GGML_RESTRICT x1 = (const block_q1_0 *) ((const uint8_t *) vx + bx);
+        const block_q8_0 * GGML_RESTRICT y0 = vy;
+        const block_q8_0 * GGML_RESTRICT y1 = (const block_q8_0 *) ((const uint8_t *) vy + by);
+
+        __m128 acc_00 = _mm_setzero_ps();
+        __m128 acc_01 = _mm_setzero_ps();
+        __m128 acc_10 = _mm_setzero_ps();
+        __m128 acc_11 = _mm_setzero_ps();
+
+        for (int ib = 0; ib < nb; ++ib) {
+            const __m128 d00 = _mm_set1_ps(GGML_CPU_FP16_TO_FP32(x0[ib].d));
+            const __m128 d10 = _mm_set1_ps(GGML_CPU_FP16_TO_FP32(x1[ib].d));
+            const block_q8_0 * GGML_RESTRICT y0_ptr = &y0[ib * 4];
+            const block_q8_0 * GGML_RESTRICT y1_ptr = &y1[ib * 4];
+
+#define Q1_SSSE3_BLOCK_PAIR(QS_OFF, Y_IDX) \
+            { \
+                const __m128i bit_mask_00 = bytes_from_bits_16(&x0[ib].qs[(QS_OFF) + 0]); \
+                const __m128i bit_mask_01 = bytes_from_bits_16(&x0[ib].qs[(QS_OFF) + 2]); \
+                const __m128i bit_mask_10 = bytes_from_bits_16(&x1[ib].qs[(QS_OFF) + 0]); \
+                const __m128i bit_mask_11 = bytes_from_bits_16(&x1[ib].qs[(QS_OFF) + 2]); \
+                const __m128i qy0_0 = _mm_loadu_si128((const __m128i *) &y0_ptr[(Y_IDX)].qs[0]); \
+                const __m128i qy0_1 = _mm_loadu_si128((const __m128i *) &y0_ptr[(Y_IDX)].qs[16]); \
+                const __m128i qy1_0 = _mm_loadu_si128((const __m128i *) &y1_ptr[(Y_IDX)].qs[0]); \
+                const __m128i qy1_1 = _mm_loadu_si128((const __m128i *) &y1_ptr[(Y_IDX)].qs[16]); \
+                const __m128i sign_mask_00 = _mm_cmpeq_epi8(bit_mask_00, zero); \
+                const __m128i sign_mask_01 = _mm_cmpeq_epi8(bit_mask_01, zero); \
+                const __m128i sign_mask_10 = _mm_cmpeq_epi8(bit_mask_10, zero); \
+                const __m128i sign_mask_11 = _mm_cmpeq_epi8(bit_mask_11, zero); \
+                const __m128i sy00_0 = _mm_sub_epi8(_mm_xor_si128(qy0_0, sign_mask_00), sign_mask_00); \
+                const __m128i sy00_1 = _mm_sub_epi8(_mm_xor_si128(qy0_1, sign_mask_01), sign_mask_01); \
+                const __m128i sy01_0 = _mm_sub_epi8(_mm_xor_si128(qy1_0, sign_mask_00), sign_mask_00); \
+                const __m128i sy01_1 = _mm_sub_epi8(_mm_xor_si128(qy1_1, sign_mask_01), sign_mask_01); \
+                const __m128i sy10_0 = _mm_sub_epi8(_mm_xor_si128(qy0_0, sign_mask_10), sign_mask_10); \
+                const __m128i sy10_1 = _mm_sub_epi8(_mm_xor_si128(qy0_1, sign_mask_11), sign_mask_11); \
+                const __m128i sy11_0 = _mm_sub_epi8(_mm_xor_si128(qy1_0, sign_mask_10), sign_mask_10); \
+                const __m128i sy11_1 = _mm_sub_epi8(_mm_xor_si128(qy1_1, sign_mask_11), sign_mask_11); \
+                const __m128i sum_00_0 = _mm_madd_epi16(_mm_maddubs_epi16(ones_8, sy00_0), ones_16); \
+                const __m128i sum_00_1 = _mm_madd_epi16(_mm_maddubs_epi16(ones_8, sy00_1), ones_16); \
+                const __m128i sum_01_0 = _mm_madd_epi16(_mm_maddubs_epi16(ones_8, sy01_0), ones_16); \
+                const __m128i sum_01_1 = _mm_madd_epi16(_mm_maddubs_epi16(ones_8, sy01_1), ones_16); \
+                const __m128i sum_10_0 = _mm_madd_epi16(_mm_maddubs_epi16(ones_8, sy10_0), ones_16); \
+                const __m128i sum_10_1 = _mm_madd_epi16(_mm_maddubs_epi16(ones_8, sy10_1), ones_16); \
+                const __m128i sum_11_0 = _mm_madd_epi16(_mm_maddubs_epi16(ones_8, sy11_0), ones_16); \
+                const __m128i sum_11_1 = _mm_madd_epi16(_mm_maddubs_epi16(ones_8, sy11_1), ones_16); \
+                const __m128 q00 = _mm_cvtepi32_ps(_mm_add_epi32(sum_00_0, sum_00_1)); \
+                const __m128 q01 = _mm_cvtepi32_ps(_mm_add_epi32(sum_01_0, sum_01_1)); \
+                const __m128 q10 = _mm_cvtepi32_ps(_mm_add_epi32(sum_10_0, sum_10_1)); \
+                const __m128 q11 = _mm_cvtepi32_ps(_mm_add_epi32(sum_11_0, sum_11_1)); \
+                acc_00 = _mm_add_ps(acc_00, _mm_mul_ps(_mm_mul_ps(d00, _mm_set1_ps(GGML_CPU_FP16_TO_FP32(y0_ptr[(Y_IDX)].d))), q00)); \
+                acc_01 = _mm_add_ps(acc_01, _mm_mul_ps(_mm_mul_ps(d00, _mm_set1_ps(GGML_CPU_FP16_TO_FP32(y1_ptr[(Y_IDX)].d))), q01)); \
+                acc_10 = _mm_add_ps(acc_10, _mm_mul_ps(_mm_mul_ps(d10, _mm_set1_ps(GGML_CPU_FP16_TO_FP32(y0_ptr[(Y_IDX)].d))), q10)); \
+                acc_11 = _mm_add_ps(acc_11, _mm_mul_ps(_mm_mul_ps(d10, _mm_set1_ps(GGML_CPU_FP16_TO_FP32(y1_ptr[(Y_IDX)].d))), q11)); \
+            }
+            Q1_SSSE3_BLOCK_PAIR(0, 0)
+            Q1_SSSE3_BLOCK_PAIR(4, 1)
+            Q1_SSSE3_BLOCK_PAIR(8, 2)
+            Q1_SSSE3_BLOCK_PAIR(12, 3)
+#undef Q1_SSSE3_BLOCK_PAIR
+        }
+
+        s[0] = hsum_float_4(acc_00);
+        s[1] = hsum_float_4(acc_10);
+        s[bs] = hsum_float_4(acc_01);
+        s[bs + 1] = hsum_float_4(acc_11);
+        return;
+    }
+
+    assert(nrc == 1);
     __m128 acc_0 = _mm_setzero_ps();
     __m128 acc_1 = _mm_setzero_ps();
     __m128 acc_2 = _mm_setzero_ps();
