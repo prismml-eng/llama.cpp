@@ -1273,6 +1273,20 @@ static void ggml_compute_forward_mul_mat_one_chunk(
                         ++ir0;
                     }
                 }
+                else if (type == GGML_TYPE_Q1_0 && num_rows_per_vec_dot == 1) {
+                    const int64_t ir0_block_end = MIN(iir0 + blck_0, ir0_end);
+
+                    for (int64_t ir0 = iir0; ir0 < ir0_block_end; ) {
+                        if (ir0 + 2 <= ir0_block_end) {
+                            ggml_vec_dot_q1_0_q8_0_2x1(ne00, &tmp[ir0 - iir0], 16, src0_row + ir0 * nb01, nb01, src1_col);
+                            ir0 += 2;
+                            continue;
+                        }
+
+                        vec_dot(ne00, &tmp[ir0 - iir0], 0, src0_row + ir0 * nb01, 0, src1_col, 0, 1);
+                        ++ir0;
+                    }
+                }
                 else
 #endif
                 for (int64_t ir0 = iir0; ir0 < iir0 + blck_0 && ir0 < ir0_end; ir0 += num_rows_per_vec_dot) {
