@@ -108,6 +108,50 @@ kernel void kernel_transpose_32(
 
 }
 
+// 32-bit transpose with bounds checking and padding support
+// For Q1_0 GEMM - keeps float32 (no FP16 conversion)
+// rows = original N (may not be multiple of 4)
+// cols = K/4 (K dimension in tiles)
+// padded_rows = ceil(N/4) for output stride
+kernel void kernel_transpose_32_32(
+    __read_only image1d_buffer_t input,
+    __write_only image1d_buffer_t output,
+    const uint rows,
+    const uint cols,
+    const uint padded_rows
+) {
+    const int i = get_global_id(0);  // column tile (0 to cols-1)
+    const int j = get_global_id(1);  // row tile (0 to padded_rows-1)
+    const int i_2 = i << 2;
+    const int j_2 = j << 2;
+
+    float4 temp0 = (float4)(0, 0, 0, 0);
+    float4 temp1 = (float4)(0, 0, 0, 0);
+    float4 temp2 = (float4)(0, 0, 0, 0);
+    float4 temp3 = (float4)(0, 0, 0, 0);
+
+    // Only load from valid locations (rows may not be multiple of 4)
+    if (j_2 + 0 < rows) {
+        temp0 = read_imagef(input, (j_2 + 0) * cols + i);
+    }
+    if (j_2 + 1 < rows) {
+        temp1 = read_imagef(input, (j_2 + 1) * cols + i);
+    }
+    if (j_2 + 2 < rows) {
+        temp2 = read_imagef(input, (j_2 + 2) * cols + i);
+    }
+    if (j_2 + 3 < rows) {
+        temp3 = read_imagef(input, (j_2 + 3) * cols + i);
+    }
+
+    // Output is (cols*4 x padded_rows*4) = (K x N_padded) row-major
+    // Write transposed 4x4 tile
+    write_imagef(output, (i_2 + 0) * padded_rows + j, (float4)(temp0.s0, temp1.s0, temp2.s0, temp3.s0));
+    write_imagef(output, (i_2 + 1) * padded_rows + j, (float4)(temp0.s1, temp1.s1, temp2.s1, temp3.s1));
+    write_imagef(output, (i_2 + 2) * padded_rows + j, (float4)(temp0.s2, temp1.s2, temp2.s2, temp3.s2));
+    write_imagef(output, (i_2 + 3) * padded_rows + j, (float4)(temp0.s3, temp1.s3, temp2.s3, temp3.s3));
+}
+
 // 32-bit transpose, loading/storing a 4x4 tile of elements
 // Only used for activations
 // converts to FP16

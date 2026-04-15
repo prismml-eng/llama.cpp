@@ -361,6 +361,50 @@ kernel void kernel_restore_block_mxfp4_trans(
 }
 
 //------------------------------------------------------------------------------
+// block_q1_0 - 1-bit quantization with group size 128
+// group size 128, 1.125 bpw
+//------------------------------------------------------------------------------
+#define QK1_0 128
+
+typedef struct {
+    half d;                        // delta (scale)
+    uchar qs[QK1_0 / 8];      // 16 bytes = 128 bits for 128 weights
+} block_q1_0;
+
+// Convert block_q1_0 AoS -> SoA (separate scales and quants)
+kernel void kernel_convert_block_q1_0(
+    global block_q1_0 * src0,
+    global uchar * dst_q,
+    global half  * dst_d
+) {
+    global block_q1_0 * b = (global block_q1_0 *) src0 + get_global_id(0);
+    global uchar           * q = (global uchar *) dst_q + (QK1_0/8)*get_global_id(0);
+    global half            * d = (global half *) dst_d + get_global_id(0);
+
+    *d = b->d;
+
+    // Copy 16 bytes of quantized bits
+    for (int i = 0; i < QK1_0/8; ++i) {
+        q[i] = b->qs[i];
+    }
+}
+
+kernel void kernel_restore_block_q1_0(
+    global uchar * src_q,
+    global half  * src_d,
+    global block_q1_0 * dst
+) {
+    global block_q1_0 * b = (global block_q1_0 *) dst + get_global_id(0);
+    global uchar           * q = (global uchar *) src_q + (QK1_0/8)*get_global_id(0);
+    global half            * d = (global half *) src_d + get_global_id(0);
+
+    b->d = *d;
+    for (int i = 0; i < QK1_0/8; ++i) {
+        b->qs[i] = q[i];
+    }
+}
+
+//------------------------------------------------------------------------------
 // block_q8_0
 //------------------------------------------------------------------------------
 typedef struct {
