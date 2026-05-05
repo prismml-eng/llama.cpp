@@ -590,15 +590,15 @@ static NOINLINE void ggml_vec_dot_q1_0_q8_0_vl128(const int n, float * GGML_REST
 void ggml_vec_dot_q1_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
 #if defined(__riscv_v)
     assert(nrc == 1);
-    UNUSED(nrc);
-    UNUSED(bx);
-    UNUSED(by);
-    UNUSED(bs);
 
-    if (__riscv_vlenb() * 8 >= 256) {
+    const size_t vlen_bits = __riscv_vlenb() * 8;
+
+    if (vlen_bits >= 256) {
         ggml_vec_dot_q1_0_q8_0_vl256(n, s, vx, vy);
-    } else {
+    } else if (vlen_bits >= 128) {
         ggml_vec_dot_q1_0_q8_0_vl128(n, s, vx, vy);
+    } else {
+        ggml_vec_dot_q1_0_q8_0_generic(n, s, bs, vx, bx, vy, by, nrc);
     }
 #else
     ggml_vec_dot_q1_0_q8_0_generic(n, s, bs, vx, bx, vy, by, nrc);
