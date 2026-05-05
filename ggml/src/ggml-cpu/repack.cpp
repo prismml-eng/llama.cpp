@@ -929,58 +929,52 @@ void ggml_gemv_q4_0_8x8_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, 
 void ggml_gemv_q1_0_8x32_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
     assert (n % QK1_0 == 0);
     assert (nc % 8 == 0);
+    assert (nr == 1);
 
     UNUSED(bs);
     UNUSED(nr);
 
     const int nb = n / QK1_0;
-    const int nb32 = n / QK8_0;
     const int ncols8 = nc / 8;
 
     const block_q1_0x8 * vx_bi = (const block_q1_0x8 *)vx;
     const block_q8_0 * a_ptr = (const block_q8_0 *)vy;
 
-    for (int y = 0; y < nr; ++y) {
-        const block_q8_0 * a_row = a_ptr + (size_t)y * nb32;
-        float * row_out = s + (size_t)y * nc;
+    for (int x = 0; x < ncols8; ++x) {
+        const block_q1_0x8 * b_ptr = vx_bi + (size_t)x * nb;
 
-        for (int x = 0; x < ncols8; ++x) {
-            const block_q1_0x8 * b_ptr = vx_bi + (size_t)x * nb;
+        float acc[8] = {0};
 
-            float acc[8] = {0};
+        for (int l = 0; l < nb; ++l) {
+            float bd[8];
+            for (int c = 0; c < 8; ++c)
+                bd[c] = GGML_CPU_FP16_TO_FP32(b_ptr[l].d[c]);
 
-            for (int l = 0; l < nb; ++l) {
-                float bd[8];
-                for (int c = 0; c < 8; ++c)
-                    bd[c] = GGML_CPU_FP16_TO_FP32(b_ptr[l].d[c]);
+            float block_acc[8] = {0};
 
-                float block_acc[8] = {0};
+            for (int sb = 0; sb < 4; ++sb) {
+                const block_q8_0 * yb = &a_ptr[l * 4 + sb];
+                const float dy = GGML_CPU_FP16_TO_FP32(yb->d);
 
-                for (int sb = 0; sb < 4; ++sb) {
-                    const block_q8_0 * yb = &a_row[l * 4 + sb];
-                    const float dy = GGML_CPU_FP16_TO_FP32(yb->d);
-
-                    const uint8_t * qs = (const uint8_t *)b_ptr[l].qs + sb * 32;
-                    const int8_t * y = yb->qs;
-
-                    for (int c = 0; c < 8; ++c) {
-                        int sumi = 0;
-                        for (int i = 0; i < QK8_0; ++i) {
-                            sumi += ((qs[i] >> c) & 1) ? y[i] : -y[i];
-                        }
-                        block_acc[c] += dy * (float)sumi;
-                    }
-                }
+                const uint8_t * qs = (const uint8_t *)b_ptr[l].qs + sb * 32;
+                const int8_t * y = yb->qs;
 
                 for (int c = 0; c < 8; ++c) {
-                    acc[c] += bd[c] * block_acc[c];
+                    int sumi = 0;
+                    for (int i = 0; i < QK8_0; ++i) {
+                        sumi += ((qs[i] >> c) & 1) ? y[i] : -y[i];
+                    }
+                    block_acc[c] += dy * (float)sumi;
                 }
             }
 
             for (int c = 0; c < 8; ++c) {
-                row_out[x * 8 + c] = acc[c];
+                acc[c] += bd[c] * block_acc[c];
             }
         }
+        
+        static_assert(sizeof(acc) == 32);
+        memcpy(s + x*8, acc, sizeof(acc));
     }
 }
 
