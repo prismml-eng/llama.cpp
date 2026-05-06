@@ -482,20 +482,6 @@ void ggml_vec_dot_q8_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
 }
 
 #if defined(__riscv_v)
-alignas(32) static const uint8_t q1_byte_sel_32[32] = {
-    0, 0, 0, 0, 0, 0, 0, 0,
-    1, 1, 1, 1, 1, 1, 1, 1,
-    2, 2, 2, 2, 2, 2, 2, 2,
-    3, 3, 3, 3, 3, 3, 3, 3,
-};
-
-alignas(32) static const uint8_t q1_bit_mask_32[32] = {
-    1, 2, 4, 8, 16, 32, 64, 128,
-    1, 2, 4, 8, 16, 32, 64, 128,
-    1, 2, 4, 8, 16, 32, 64, 128,
-    1, 2, 4, 8, 16, 32, 64, 128,
-};
-
 static NOINLINE void ggml_vec_dot_q1_0_q8_0_vl256(const int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy) {
     const int qk = QK1_0;
     const int nb = n / qk;
@@ -508,9 +494,6 @@ static NOINLINE void ggml_vec_dot_q1_0_q8_0_vl256(const int n, float * GGML_REST
     const size_t vl32 = __riscv_vsetvl_e8m1(32);
     assert(vl32 == 32);
 
-    const vuint8m1_t sel  = __riscv_vle8_v_u8m1(q1_byte_sel_32, vl32);
-    const vuint8m1_t mask = __riscv_vle8_v_u8m1(q1_bit_mask_32, vl32);
-
     const vint16m1_t zero = __riscv_vmv_v_x_i16m1(0, 1);
 
     float sumf = 0;
@@ -522,14 +505,11 @@ static NOINLINE void ggml_vec_dot_q1_0_q8_0_vl256(const int n, float * GGML_REST
 
         for (int k = 0; k < 4; ++k) {
             const block_q8_0 * GGML_RESTRICT yb = &y[ib * 4 + k];
-            const vuint8m1_t qx4 = __riscv_vle8_v_u8m1(x[ib].qs + 4 * k, 4);
-            const vuint8m1_t qbyte = __riscv_vrgather_vv_u8m1(qx4, sel, vl32);
-            const vuint8m1_t bit = __riscv_vand_vv_u8m1(qbyte, mask, vl32);
+            const vbool8_t is_not_zero = __riscv_vlm_v_b8(x[ib].qs + 4 * k, vl32);
 
-            const vbool8_t is_zero = __riscv_vmseq_vx_u8m1_b8(bit, 0, vl32);
             const vint8m1_t qy = __riscv_vle8_v_i8m1(yb->qs, vl32);
             const vint8m1_t neg_qy = __riscv_vneg_v_i8m1(qy, vl32);
-            const vint8m1_t sy = __riscv_vmerge_vvm_i8m1(qy, neg_qy, is_zero, vl32);
+            const vint8m1_t sy = __riscv_vmerge_vvm_i8m1(neg_qy, qy, is_not_zero, vl32);
 
             const vint16m1_t red = __riscv_vwredsum_vs_i8m1_i16m1(sy, zero, vl32);
             acc += GGML_CPU_FP16_TO_FP32(yb->d) * (float)__riscv_vmv_x_s_i16m1_i16(red);
@@ -553,9 +533,6 @@ static NOINLINE void ggml_vec_dot_q1_0_q8_0_vl128(const int n, float * GGML_REST
     const size_t vl32 = __riscv_vsetvl_e8m2(32);
     assert(vl32 == 32);
 
-    const vuint8m2_t sel  = __riscv_vle8_v_u8m2(q1_byte_sel_32, vl32);
-    const vuint8m2_t mask = __riscv_vle8_v_u8m2(q1_bit_mask_32, vl32);
-
     const vint16m1_t zero = __riscv_vmv_v_x_i16m1(0, 1);
 
     float sumf = 0;
@@ -567,14 +544,11 @@ static NOINLINE void ggml_vec_dot_q1_0_q8_0_vl128(const int n, float * GGML_REST
 
         for (int k = 0; k < 4; ++k) {
             const block_q8_0 * GGML_RESTRICT yb = &y[ib * 4 + k];
-            const vuint8m2_t qx4 = __riscv_vle8_v_u8m2(x[ib].qs + 4 * k, 4);
-            const vuint8m2_t qbyte = __riscv_vrgather_vv_u8m2(qx4, sel, vl32);
-            const vuint8m2_t bit = __riscv_vand_vv_u8m2(qbyte, mask, vl32);
+            const vbool4_t is_not_zero = __riscv_vlm_v_b4(x[ib].qs + 4 * k, vl32);
 
-            const vbool4_t is_zero =__riscv_vmseq_vx_u8m2_b4(bit, 0, vl32);
             const vint8m2_t qy = __riscv_vle8_v_i8m2(yb->qs, vl32);
             const vint8m2_t neg_qy =__riscv_vneg_v_i8m2(qy, vl32);
-            const vint8m2_t sy = __riscv_vmerge_vvm_i8m2(qy, neg_qy, is_zero, vl32);
+            const vint8m2_t sy = __riscv_vmerge_vvm_i8m2(neg_qy, qy, is_not_zero, vl32);
 
             const vint16m1_t red = __riscv_vwredsum_vs_i8m2_i16m1(sy, zero, vl32);
             acc += GGML_CPU_FP16_TO_FP32(yb->d) * (float)__riscv_vmv_x_s_i16m1_i16(red);
