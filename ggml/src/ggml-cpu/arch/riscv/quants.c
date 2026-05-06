@@ -490,7 +490,7 @@ static NOINLINE void ggml_vec_dot_q1_0_q8_0_vl256(const int n, float * GGML_REST
     const block_q1_0 * GGML_RESTRICT x = vx;
     const block_q8_0 * GGML_RESTRICT y = vy;
 
-    //LMUL = 1, VLMAX = 256
+    //LMUL = 1, VLMAX = 32
     const size_t vl32 = __riscv_vsetvl_e8m1(32);
     assert(vl32 == 32);
 
@@ -529,7 +529,7 @@ static NOINLINE void ggml_vec_dot_q1_0_q8_0_vl128(const int n, float * GGML_REST
     const block_q1_0 * GGML_RESTRICT x = vx;
     const block_q8_0 * GGML_RESTRICT y = vy;
 
-    //LMUL = 2, VLMAX = 256
+    //LMUL = 2, VLMAX = 32
     const size_t vl32 = __riscv_vsetvl_e8m2(32);
     assert(vl32 == 32);
 
