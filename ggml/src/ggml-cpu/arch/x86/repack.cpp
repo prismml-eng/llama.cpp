@@ -175,6 +175,74 @@ static inline __m256i mul_sum_i8_pairs_acc_int32x8(const __m256i acc, const __m2
 }
 #endif
 
+void ggml_quantize_mat_q8_0_4x4(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
+    assert(QK8_0 == 32);
+    assert(k % QK8_0 == 0);
+    const int nb = k / QK8_0;
+
+    block_q8_0x4 * GGML_RESTRICT y = (block_q8_0x4 *) vy;
+
+#if defined(__AVX2__)
+    const __m256 signBit = _mm256_set1_ps(-0.0f);
+
+    for (int i = 0; i < nb; ++i) {
+        __m256 srcv[4][4];
+        __m256 idv[4];
+
+        for (int r = 0; r < 4; ++r) {
+            const float *xr = x + r * k + i * 32;
+
+            srcv[r][0] = _mm256_loadu_ps(xr + 0);
+            srcv[r][1] = _mm256_loadu_ps(xr + 8);
+            srcv[r][2] = _mm256_loadu_ps(xr + 16);
+            srcv[r][3] = _mm256_loadu_ps(xr + 24);
+
+            __m256 maxAbs = _mm256_andnot_ps(signBit, srcv[r][0]);
+            maxAbs = _mm256_max_ps(maxAbs, _mm256_andnot_ps(signBit, srcv[r][1]));
+            maxAbs = _mm256_max_ps(maxAbs, _mm256_andnot_ps(signBit, srcv[r][2]));
+            maxAbs = _mm256_max_ps(maxAbs, _mm256_andnot_ps(signBit, srcv[r][3]));
+
+            __m128 max4 = _mm_max_ps(_mm256_castps256_ps128(maxAbs), _mm256_extractf128_ps(maxAbs, 1));
+            max4 = _mm_max_ps(max4, _mm_movehl_ps(max4, max4));
+            max4 = _mm_max_ss(max4, _mm_movehdup_ps(max4));
+
+            const float amax = _mm_cvtss_f32(max4);
+            const float d = amax / 127.0f;
+            const float id = amax != 0.0f ? 127.0f / amax : 0.0f;
+
+            y[i].d[r] = GGML_CPU_FP32_TO_FP16(d);
+            idv[r] = _mm256_set1_ps(id);
+        }
+
+        for (int j = 0; j < 4; ++j) {
+            __m256 q0 = _mm256_mul_ps(srcv[0][j], idv[0]);
+            __m256 q1 = _mm256_mul_ps(srcv[1][j], idv[1]);
+            __m256 q2 = _mm256_mul_ps(srcv[2][j], idv[2]);
+            __m256 q3 = _mm256_mul_ps(srcv[3][j], idv[3]);
+
+            q0 = _mm256_round_ps(q0, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+            q1 = _mm256_round_ps(q1, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+            q2 = _mm256_round_ps(q2, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+            q3 = _mm256_round_ps(q3, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+
+            __m256i i0 = _mm256_cvtps_epi32(q0);
+            __m256i i1 = _mm256_cvtps_epi32(q1);
+            __m256i i2 = _mm256_cvtps_epi32(q2);
+            __m256i i3 = _mm256_cvtps_epi32(q3);
+
+            const __m256i p01 = _mm256_packs_epi32(i0, i1);
+            const __m256i p23 = _mm256_packs_epi32(i2, i3);
+
+            const __m256i packed = _mm256_packs_epi16(p01, p23);
+
+            _mm256_storeu_si256((__m256i *)(y[i].qs + j * 32), packed);
+        }
+    }
+#else
+    ggml_quantize_mat_q8_0_4x4_generic(x, vy, k);
+#endif
+}
+
 void ggml_quantize_mat_q8_0_4x8(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
     assert(QK8_0 == 32);
     assert(k % QK8_0 == 0);
@@ -284,75 +352,6 @@ void ggml_quantize_mat_q8_0_4x8(const float * GGML_RESTRICT x, void * GGML_RESTR
     UNUSED(nb);
     UNUSED(y);
     ggml_quantize_mat_q8_0_4x8_generic(x, vy, k);
-#endif
-}
-
-void ggml_quantize_mat_q8_0_4x32(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
-    assert(QK8_0 == 32);
-    assert(k % QK8_0 == 0);
-    const int nb = k / QK8_0;
-
-    block_q8_0x4 * GGML_RESTRICT y = (block_q8_0x4 *) vy;
-
-#if defined(__AVX2__)
-    for (int i = 0; i < nb; i++) {
-        for (int r = 0; r < 4; r++) {
-            // Load elements into 4 AVX vectors
-            __m256 v0 = _mm256_loadu_ps( x + r * k + i * 32 );
-            __m256 v1 = _mm256_loadu_ps( x + r * k + i * 32 + 8 );
-            __m256 v2 = _mm256_loadu_ps( x + r * k + i * 32 + 16 );
-            __m256 v3 = _mm256_loadu_ps( x + r * k + i * 32 + 24 );
-
-            // Compute max(abs(e)) for the block
-            const __m256 signBit = _mm256_set1_ps( -0.0f );
-            __m256 maxAbs = _mm256_andnot_ps( signBit, v0 );
-            maxAbs = _mm256_max_ps( maxAbs, _mm256_andnot_ps( signBit, v1 ) );
-            maxAbs = _mm256_max_ps( maxAbs, _mm256_andnot_ps( signBit, v2 ) );
-            maxAbs = _mm256_max_ps( maxAbs, _mm256_andnot_ps( signBit, v3 ) );
-
-            __m128 max4 = _mm_max_ps( _mm256_extractf128_ps( maxAbs, 1 ), _mm256_castps256_ps128( maxAbs ) );
-            max4 = _mm_max_ps( max4, _mm_movehl_ps( max4, max4 ) );
-            max4 = _mm_max_ss( max4, _mm_movehdup_ps( max4 ) );
-            const float maxScalar = _mm_cvtss_f32( max4 );
-
-            const float d = maxScalar / 127.f;
-            y[i].d[r] = GGML_CPU_FP32_TO_FP16(d);
-            const float id = ( maxScalar != 0.0f ) ? 127.f / maxScalar : 0.0f;
-            const __m256 mul = _mm256_set1_ps( id );
-
-            // Apply multiplier
-            v0 = _mm256_mul_ps( v0, mul );
-            v1 = _mm256_mul_ps( v1, mul );
-            v2 = _mm256_mul_ps( v2, mul );
-            v3 = _mm256_mul_ps( v3, mul );
-
-            // Round
-            v0 = _mm256_round_ps( v0, _MM_ROUND_NEAREST );
-            v1 = _mm256_round_ps( v1, _MM_ROUND_NEAREST );
-            v2 = _mm256_round_ps( v2, _MM_ROUND_NEAREST );
-            v3 = _mm256_round_ps( v3, _MM_ROUND_NEAREST );
-
-            // Convert to int
-            __m256i i0 = _mm256_cvtps_epi32( v0 );
-            __m256i i1 = _mm256_cvtps_epi32( v1 );
-            __m256i i2 = _mm256_cvtps_epi32( v2 );
-            __m256i i3 = _mm256_cvtps_epi32( v3 );
-
-            i0 = _mm256_packs_epi32( i0, i1 );
-            i2 = _mm256_packs_epi32( i2, i3 );
-            i0 = _mm256_packs_epi16( i0, i2 );
-
-            const __m256i perm = _mm256_setr_epi32( 0, 4, 1, 5, 2, 6, 3, 7 );
-            i0 = _mm256_permutevar8x32_epi32( i0, perm );
-
-            // Store row r contiguously
-            _mm256_storeu_si256((__m256i *)(y[i].qs + r * 32), i0);
-        }
-    }
-#else
-    UNUSED(nb);
-    UNUSED(y);
-    ggml_quantize_mat_q8_0_4x32_generic(x, vy, k);
 #endif
 }
 
@@ -1530,177 +1529,6 @@ void ggml_gemv_q4_0_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
     ggml_gemv_q4_0_8x8_q8_0_generic(n, s, bs, vx, vy, nr, nc);
 }
 
-void ggml_gemv_q1_0_8x32_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
-#if defined( __AVX2__ ) || defined( __AVX512F__ )
-    {
-        assert (n % QK1_0 == 0);
-        assert (nc % 8 == 0);
-        assert (nr == 1);
-
-        UNUSED(bs);
-        UNUSED(nr);
-
-        const int nb = n / QK1_0;
-        const int ncols8 = nc / 8;
-
-        const __m256i ones_8 = _mm256_set1_epi8(1);
-        const __m256i ones_16 = _mm256_set1_epi16(1);
-        const __m256i zero = _mm256_setzero_si256();
-
-        // Shuffle LUTs for columns 0-3: LUT[b & 0xF] = (b >> c) & 1 ? 0x00 : 0xFF
-        alignas(16) static const uint8_t sm_lut_c0[16] = {
-            0xFF, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF, 0x00,
-            0xFF, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF, 0x00
-        };
-        alignas(16) static const uint8_t sm_lut_c1[16] = {
-            0xFF, 0xFF, 0x00, 0x00, 0xFF, 0xFF, 0x00, 0x00,
-            0xFF, 0xFF, 0x00, 0x00, 0xFF, 0xFF, 0x00, 0x00
-        };
-        alignas(16) static const uint8_t sm_lut_c2[16] = {
-            0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00,
-            0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00
-        };
-        alignas(16) static const uint8_t sm_lut_c3[16] = {
-            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
-        };
-
-        const __m256i lut0 = _mm256_broadcastsi128_si256(_mm_load_si128((const __m128i *)sm_lut_c0));
-        const __m256i lut1 = _mm256_broadcastsi128_si256(_mm_load_si128((const __m128i *)sm_lut_c1));
-        const __m256i lut2 = _mm256_broadcastsi128_si256(_mm_load_si128((const __m128i *)sm_lut_c2));
-        const __m256i lut3 = _mm256_broadcastsi128_si256(_mm_load_si128((const __m128i *)sm_lut_c3));
-
-        // Column masks for columns 4-7 (AND+cmpeq path)
-        const __m256i col_mask_4 = _mm256_set1_epi8(16);
-        const __m256i col_mask_5 = _mm256_set1_epi8(32);
-        const __m256i col_mask_6 = _mm256_set1_epi8(64);
-        const __m256i col_mask_7 = _mm256_set1_epi8((int8_t)-128);
-
-        const __m256i low_nibble_mask = _mm256_set1_epi8(0x0F);
-
-        const block_q1_0x8 * vx_bi = (const block_q1_0x8 *)vx;
-        const block_q8_0 * a_ptr = (const block_q8_0 *)vy;
-
-        for (int x = 0; x < ncols8; ++x) {
-            const block_q1_0x8 * b_ptr = vx_bi + (size_t)x * nb;
-
-            __m256 acc0 = _mm256_setzero_ps();
-            __m256 acc1 = _mm256_setzero_ps();
-            __m256 acc2 = _mm256_setzero_ps();
-            __m256 acc3 = _mm256_setzero_ps();
-            __m256 acc4 = _mm256_setzero_ps();
-            __m256 acc5 = _mm256_setzero_ps();
-            __m256 acc6 = _mm256_setzero_ps();
-            __m256 acc7 = _mm256_setzero_ps();
-
-            for (int l = 0; l < nb; ++l) {
-                float bd[8];
-                for (int c = 0; c < 8; ++c) {
-                    bd[c] = GGML_CPU_FP16_TO_FP32(b_ptr[l].d[c]);
-                }
-
-                __m256 ba0 = _mm256_setzero_ps();
-                __m256 ba1 = _mm256_setzero_ps();
-                __m256 ba2 = _mm256_setzero_ps();
-                __m256 ba3 = _mm256_setzero_ps();
-                __m256 ba4 = _mm256_setzero_ps();
-                __m256 ba5 = _mm256_setzero_ps();
-                __m256 ba6 = _mm256_setzero_ps();
-                __m256 ba7 = _mm256_setzero_ps();
-
-                const uint8_t * qs_base = (const uint8_t *)b_ptr[l].qs;
-
-                for (int sb = 0; sb < 4; ++sb) {
-                    const block_q8_0 * yb = &a_ptr[l * 4 + sb];
-                    const __m256i rhs = _mm256_loadu_si256((const __m256i *)yb->qs);
-                    const __m256 dy = _mm256_set1_ps(GGML_CPU_FP16_TO_FP32(yb->d));
-
-                    const __m256i qs_vec = _mm256_loadu_si256((const __m256i *)(qs_base + sb * 32));
-
-                    // Columns 0-3: shuffle LUT on low 7 bits
-                    const __m256i qs_lo4 = _mm256_and_si256(qs_vec, low_nibble_mask);
-                    const __m256i sm0 = _mm256_shuffle_epi8(lut0, qs_lo4);
-                    const __m256i sm1 = _mm256_shuffle_epi8(lut1, qs_lo4);
-                    const __m256i sm2 = _mm256_shuffle_epi8(lut2, qs_lo4);
-                    const __m256i sm3 = _mm256_shuffle_epi8(lut3, qs_lo4);
-
-                    // Columns 4-7: AND + cmpeq
-                    const __m256i sm4 = _mm256_cmpeq_epi8(_mm256_and_si256(qs_vec, col_mask_4), zero);
-                    const __m256i sm5 = _mm256_cmpeq_epi8(_mm256_and_si256(qs_vec, col_mask_5), zero);
-                    const __m256i sm6 = _mm256_cmpeq_epi8(_mm256_and_si256(qs_vec, col_mask_6), zero);
-                    const __m256i sm7 = _mm256_cmpeq_epi8(_mm256_and_si256(qs_vec, col_mask_7), zero);
-
-                    // Sign-flip and accumulate for all 8 columns
-                    const __m256i sy0 = _mm256_sub_epi8(_mm256_xor_si256(rhs, sm0), sm0);
-                    const __m256i sy1 = _mm256_sub_epi8(_mm256_xor_si256(rhs, sm1), sm1);
-                    const __m256i sy2 = _mm256_sub_epi8(_mm256_xor_si256(rhs, sm2), sm2);
-                    const __m256i sy3 = _mm256_sub_epi8(_mm256_xor_si256(rhs, sm3), sm3);
-                    const __m256i sy4 = _mm256_sub_epi8(_mm256_xor_si256(rhs, sm4), sm4);
-                    const __m256i sy5 = _mm256_sub_epi8(_mm256_xor_si256(rhs, sm5), sm5);
-                    const __m256i sy6 = _mm256_sub_epi8(_mm256_xor_si256(rhs, sm6), sm6);
-                    const __m256i sy7 = _mm256_sub_epi8(_mm256_xor_si256(rhs, sm7), sm7);
-
-                    ba0 = _mm256_fmadd_ps(dy, _mm256_cvtepi32_ps(_mm256_madd_epi16(_mm256_maddubs_epi16(ones_8, sy0), ones_16)), ba0);
-                    ba1 = _mm256_fmadd_ps(dy, _mm256_cvtepi32_ps(_mm256_madd_epi16(_mm256_maddubs_epi16(ones_8, sy1), ones_16)), ba1);
-                    ba2 = _mm256_fmadd_ps(dy, _mm256_cvtepi32_ps(_mm256_madd_epi16(_mm256_maddubs_epi16(ones_8, sy2), ones_16)), ba2);
-                    ba3 = _mm256_fmadd_ps(dy, _mm256_cvtepi32_ps(_mm256_madd_epi16(_mm256_maddubs_epi16(ones_8, sy3), ones_16)), ba3);
-                    ba4 = _mm256_fmadd_ps(dy, _mm256_cvtepi32_ps(_mm256_madd_epi16(_mm256_maddubs_epi16(ones_8, sy4), ones_16)), ba4);
-                    ba5 = _mm256_fmadd_ps(dy, _mm256_cvtepi32_ps(_mm256_madd_epi16(_mm256_maddubs_epi16(ones_8, sy5), ones_16)), ba5);
-                    ba6 = _mm256_fmadd_ps(dy, _mm256_cvtepi32_ps(_mm256_madd_epi16(_mm256_maddubs_epi16(ones_8, sy6), ones_16)), ba6);
-                    ba7 = _mm256_fmadd_ps(dy, _mm256_cvtepi32_ps(_mm256_madd_epi16(_mm256_maddubs_epi16(ones_8, sy7), ones_16)), ba7);
-                }
-
-                acc0 = _mm256_fmadd_ps(_mm256_set1_ps(bd[0]), ba0, acc0);
-                acc1 = _mm256_fmadd_ps(_mm256_set1_ps(bd[1]), ba1, acc1);
-                acc2 = _mm256_fmadd_ps(_mm256_set1_ps(bd[2]), ba2, acc2);
-                acc3 = _mm256_fmadd_ps(_mm256_set1_ps(bd[3]), ba3, acc3);
-                acc4 = _mm256_fmadd_ps(_mm256_set1_ps(bd[4]), ba4, acc4);
-                acc5 = _mm256_fmadd_ps(_mm256_set1_ps(bd[5]), ba5, acc5);
-                acc6 = _mm256_fmadd_ps(_mm256_set1_ps(bd[6]), ba6, acc6);
-                acc7 = _mm256_fmadd_ps(_mm256_set1_ps(bd[7]), ba7, acc7);
-            }
-
-            {
-                const __m128 v = _mm_add_ps(_mm256_castps256_ps128(acc0), _mm256_extractf128_ps(acc0, 1));
-                s[x * 8 + 0] = _mm_cvtss_f32(_mm_hadd_ps(_mm_hadd_ps(v, v), _mm_hadd_ps(v, v)));
-            }
-            {
-                const __m128 v = _mm_add_ps(_mm256_castps256_ps128(acc1), _mm256_extractf128_ps(acc1, 1));
-                s[x * 8 + 1] = _mm_cvtss_f32(_mm_hadd_ps(_mm_hadd_ps(v, v), _mm_hadd_ps(v, v)));
-            }
-            {
-                const __m128 v = _mm_add_ps(_mm256_castps256_ps128(acc2), _mm256_extractf128_ps(acc2, 1));
-                s[x * 8 + 2] = _mm_cvtss_f32(_mm_hadd_ps(_mm_hadd_ps(v, v), _mm_hadd_ps(v, v)));
-            }
-            {
-                const __m128 v = _mm_add_ps(_mm256_castps256_ps128(acc3), _mm256_extractf128_ps(acc3, 1));
-                s[x * 8 + 3] = _mm_cvtss_f32(_mm_hadd_ps(_mm_hadd_ps(v, v), _mm_hadd_ps(v, v)));
-            }
-            {
-                const __m128 v = _mm_add_ps(_mm256_castps256_ps128(acc4), _mm256_extractf128_ps(acc4, 1));
-                s[x * 8 + 4] = _mm_cvtss_f32(_mm_hadd_ps(_mm_hadd_ps(v, v), _mm_hadd_ps(v, v)));
-            }
-            {
-                const __m128 v = _mm_add_ps(_mm256_castps256_ps128(acc5), _mm256_extractf128_ps(acc5, 1));
-                s[x * 8 + 5] = _mm_cvtss_f32(_mm_hadd_ps(_mm_hadd_ps(v, v), _mm_hadd_ps(v, v)));
-            }
-            {
-                const __m128 v = _mm_add_ps(_mm256_castps256_ps128(acc6), _mm256_extractf128_ps(acc6, 1));
-                s[x * 8 + 6] = _mm_cvtss_f32(_mm_hadd_ps(_mm_hadd_ps(v, v), _mm_hadd_ps(v, v)));
-            }
-            {
-                const __m128 v = _mm_add_ps(_mm256_castps256_ps128(acc7), _mm256_extractf128_ps(acc7, 1));
-                s[x * 8 + 7] = _mm_cvtss_f32(_mm_hadd_ps(_mm_hadd_ps(v, v), _mm_hadd_ps(v, v)));
-            }
-        }
-
-        return;
-    }
-#endif // defined( __AVX2__ ) || defined( __AVX512F__ )
-
-    ggml_gemv_q1_0_8x32_q8_0_generic(n, s, bs, vx, vy, nr, nc);
-}
-
 void ggml_gemv_q4_K_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
     const int qk = QK_K;
     const int nb = n / qk;
@@ -2279,117 +2107,619 @@ void ggml_gemm_q4_0_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
     ggml_gemm_q4_0_8x8_q8_0_generic(n, s, bs, vx, vy, nr, nc);
 }
 
-#define GGML_GEMM_Q1_0_4COL(M0, M1, M2, M3, D0, D1, D2, D3, OFF) \
-    { \
-        const __m256i cm0 = _mm256_set1_epi8(M0); \
-        const __m256i cm1 = _mm256_set1_epi8(M1); \
-        const __m256i cm2 = _mm256_set1_epi8(M2); \
-        const __m256i cm3 = _mm256_set1_epi8(M3); \
-        __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps(), a2 = _mm256_setzero_ps(), a3 = _mm256_setzero_ps(); \
-        __m256 a10 = _mm256_setzero_ps(), a11 = _mm256_setzero_ps(), a12 = _mm256_setzero_ps(), a13 = _mm256_setzero_ps(); \
-        for (int l = 0; l < nb; ++l) { \
-            const float bd0 = GGML_CPU_FP16_TO_FP32(b_ptr[l].d[D0]); \
-            const float bd1 = GGML_CPU_FP16_TO_FP32(b_ptr[l].d[D1]); \
-            const float bd2 = GGML_CPU_FP16_TO_FP32(b_ptr[l].d[D2]); \
-            const float bd3 = GGML_CPU_FP16_TO_FP32(b_ptr[l].d[D3]); \
-            __m256 b0 = _mm256_setzero_ps(), b1 = _mm256_setzero_ps(), b2 = _mm256_setzero_ps(), b3 = _mm256_setzero_ps(); \
-            __m256 b10 = _mm256_setzero_ps(), b11 = _mm256_setzero_ps(), b12 = _mm256_setzero_ps(), b13 = _mm256_setzero_ps(); \
-            const uint8_t * qs_base = (const uint8_t *)b_ptr[l].qs; \
-            for (int sb = 0; sb < 4; ++sb) { \
-                const block_q8_0x4 * yb = &a_ptr[l * 4 + sb]; \
-                const __m256i qs_vec = _mm256_loadu_si256((const __m256i *)(qs_base + sb * 32)); \
-                const __m256i sm0 = _mm256_cmpeq_epi8(_mm256_and_si256(qs_vec, cm0), zero); \
-                const __m256i sm1 = _mm256_cmpeq_epi8(_mm256_and_si256(qs_vec, cm1), zero); \
-                const __m256i sm2 = _mm256_cmpeq_epi8(_mm256_and_si256(qs_vec, cm2), zero); \
-                const __m256i sm3 = _mm256_cmpeq_epi8(_mm256_and_si256(qs_vec, cm3), zero); \
-                const __m256i rhs0 = _mm256_loadu_si256((const __m256i *)(yb->qs + (row_base + 0) * 32)); \
-                const __m256 dy0 = _mm256_set1_ps(GGML_CPU_FP16_TO_FP32(yb->d[row_base + 0])); \
-                b0 = _mm256_fmadd_ps(dy0, _mm256_cvtepi32_ps(_mm256_madd_epi16(_mm256_maddubs_epi16(ones_8, _mm256_sub_epi8(_mm256_xor_si256(rhs0, sm0), sm0)), ones_16)), b0); \
-                b1 = _mm256_fmadd_ps(dy0, _mm256_cvtepi32_ps(_mm256_madd_epi16(_mm256_maddubs_epi16(ones_8, _mm256_sub_epi8(_mm256_xor_si256(rhs0, sm1), sm1)), ones_16)), b1); \
-                b2 = _mm256_fmadd_ps(dy0, _mm256_cvtepi32_ps(_mm256_madd_epi16(_mm256_maddubs_epi16(ones_8, _mm256_sub_epi8(_mm256_xor_si256(rhs0, sm2), sm2)), ones_16)), b2); \
-                b3 = _mm256_fmadd_ps(dy0, _mm256_cvtepi32_ps(_mm256_madd_epi16(_mm256_maddubs_epi16(ones_8, _mm256_sub_epi8(_mm256_xor_si256(rhs0, sm3), sm3)), ones_16)), b3); \
-                const __m256i rhs1 = _mm256_loadu_si256((const __m256i *)(yb->qs + (row_base + 1) * 32)); \
-                const __m256 dy1 = _mm256_set1_ps(GGML_CPU_FP16_TO_FP32(yb->d[row_base + 1])); \
-                b10 = _mm256_fmadd_ps(dy1, _mm256_cvtepi32_ps(_mm256_madd_epi16(_mm256_maddubs_epi16(ones_8, _mm256_sub_epi8(_mm256_xor_si256(rhs1, sm0), sm0)), ones_16)), b10); \
-                b11 = _mm256_fmadd_ps(dy1, _mm256_cvtepi32_ps(_mm256_madd_epi16(_mm256_maddubs_epi16(ones_8, _mm256_sub_epi8(_mm256_xor_si256(rhs1, sm1), sm1)), ones_16)), b11); \
-                b12 = _mm256_fmadd_ps(dy1, _mm256_cvtepi32_ps(_mm256_madd_epi16(_mm256_maddubs_epi16(ones_8, _mm256_sub_epi8(_mm256_xor_si256(rhs1, sm2), sm2)), ones_16)), b12); \
-                b13 = _mm256_fmadd_ps(dy1, _mm256_cvtepi32_ps(_mm256_madd_epi16(_mm256_maddubs_epi16(ones_8, _mm256_sub_epi8(_mm256_xor_si256(rhs1, sm3), sm3)), ones_16)), b13); \
-            } \
-            a0 = _mm256_fmadd_ps(_mm256_set1_ps(bd0), b0, a0); \
-            a1 = _mm256_fmadd_ps(_mm256_set1_ps(bd1), b1, a1); \
-            a2 = _mm256_fmadd_ps(_mm256_set1_ps(bd2), b2, a2); \
-            a3 = _mm256_fmadd_ps(_mm256_set1_ps(bd3), b3, a3); \
-            a10 = _mm256_fmadd_ps(_mm256_set1_ps(bd0), b10, a10); \
-            a11 = _mm256_fmadd_ps(_mm256_set1_ps(bd1), b11, a11); \
-            a12 = _mm256_fmadd_ps(_mm256_set1_ps(bd2), b12, a12); \
-            a13 = _mm256_fmadd_ps(_mm256_set1_ps(bd3), b13, a13); \
-        } \
-        { \
-            const __m128 v0 = _mm_add_ps(_mm256_castps256_ps128(a0), _mm256_extractf128_ps(a0, 1)); \
-            const __m128 v1 = _mm_add_ps(_mm256_castps256_ps128(a10), _mm256_extractf128_ps(a10, 1)); \
-            s_row0[OFF + 0] = _mm_cvtss_f32(_mm_hadd_ps(_mm_hadd_ps(v0, v0), _mm_hadd_ps(v0, v0))); \
-            s_row1[OFF + 0] = _mm_cvtss_f32(_mm_hadd_ps(_mm_hadd_ps(v1, v1), _mm_hadd_ps(v1, v1))); \
-        } \
-        { \
-            const __m128 v0 = _mm_add_ps(_mm256_castps256_ps128(a1), _mm256_extractf128_ps(a1, 1)); \
-            const __m128 v1 = _mm_add_ps(_mm256_castps256_ps128(a11), _mm256_extractf128_ps(a11, 1)); \
-            s_row0[OFF + 1] = _mm_cvtss_f32(_mm_hadd_ps(_mm_hadd_ps(v0, v0), _mm_hadd_ps(v0, v0))); \
-            s_row1[OFF + 1] = _mm_cvtss_f32(_mm_hadd_ps(_mm_hadd_ps(v1, v1), _mm_hadd_ps(v1, v1))); \
-        } \
-        { \
-            const __m128 v0 = _mm_add_ps(_mm256_castps256_ps128(a2), _mm256_extractf128_ps(a2, 1)); \
-            const __m128 v1 = _mm_add_ps(_mm256_castps256_ps128(a12), _mm256_extractf128_ps(a12, 1)); \
-            s_row0[OFF + 2] = _mm_cvtss_f32(_mm_hadd_ps(_mm_hadd_ps(v0, v0), _mm_hadd_ps(v0, v0))); \
-            s_row1[OFF + 2] = _mm_cvtss_f32(_mm_hadd_ps(_mm_hadd_ps(v1, v1), _mm_hadd_ps(v1, v1))); \
-        } \
-        { \
-            const __m128 v0 = _mm_add_ps(_mm256_castps256_ps128(a3), _mm256_extractf128_ps(a3, 1)); \
-            const __m128 v1 = _mm_add_ps(_mm256_castps256_ps128(a13), _mm256_extractf128_ps(a13, 1)); \
-            s_row0[OFF + 3] = _mm_cvtss_f32(_mm_hadd_ps(_mm_hadd_ps(v0, v0), _mm_hadd_ps(v0, v0))); \
-            s_row1[OFF + 3] = _mm_cvtss_f32(_mm_hadd_ps(_mm_hadd_ps(v1, v1), _mm_hadd_ps(v1, v1))); \
-        } \
-    }
+// Rotated Q1.0 layout helpers and kernels
 
-void ggml_gemm_q1_0_8x32_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
-#if defined( __AVX2__ ) || defined( __AVX512F__ )
-    {
-        assert (n % QK1_0 == 0);
-        assert (nr % 4 == 0);
-        assert (nc % 8 == 0);
+static const int8_t q1_byte_sel[32] = {
+    0,0,0,0, 0,0,0,0,
+    1,1,1,1, 1,1,1,1,
+    2,2,2,2, 2,2,2,2,
+    3,3,3,3, 3,3,3,3,
+};
 
-        UNUSED(bs);
+static const int8_t q1_bit_mask[32] = {
+      1,  2,  4,   8,  16,  32,  64, -128,
+      1,  2,  4,   8,  16,  32,  64, -128,
+      1,  2,  4,   8,  16,  32,  64, -128,
+      1,  2,  4,   8,  16,  32,  64, -128,
+};
 
-        const int nb = n / QK1_0;
-        const int nb_q8_0 = n / QK8_0;
-        const int ncols8 = nc / 8;
-        const int nrows4 = nr / 4;
+static inline uint32_t ggml_load_u32(const void * p) {
+    return *(const uint32_t *)p;
+}
 
-        const __m256i ones_8 = _mm256_set1_epi8(1);
-        const __m256i ones_16 = _mm256_set1_epi16(1);
-        const __m256i zero = _mm256_setzero_si256();
+#if defined(__F16C__)
+static inline __m256 ggml_cvt_fp16x4_to_fp32x2(const ggml_half * p) {
+    __m128i h = _mm_loadu_si64((const void *)p);
+    __m128 f = _mm_cvtph_ps(h);
+    return _mm256_insertf128_ps(_mm256_castps128_ps256(f), f, 1);
+}
+#endif
 
-        const block_q1_0x8 * vx_bi = (const block_q1_0x8 *)vx;
 
-        for (int y = 0; y < nrows4; ++y) {
-            const block_q8_0x4 * a_ptr = (const block_q8_0x4 *)vy + (y * nb_q8_0);
 
-            for (int row_base = 0; row_base < 4; row_base += 2) {
-                for (int x8 = 0; x8 < ncols8; ++x8) {
-                    const block_q1_0x8 * b_ptr = vx_bi + (size_t)x8 * nb;
-                    float * s_row0 = s + (y * 4 + row_base + 0) * bs + x8 * 8;
-                    float * s_row1 = s + (y * 4 + row_base + 1) * bs + x8 * 8;
+static inline __m256i ggml_q1_negmask_8cols(
+        uint32_t qpack,
+        __m256i byte_sel,
+        __m256i bit_mask,
+        __m256i zero) {
+    const __m256i qsrc = _mm256_set1_epi32((int32_t)qpack);
+    const __m256i qbyte = _mm256_shuffle_epi8(qsrc, byte_sel);
+    const __m256i qbit = _mm256_and_si256(qbyte, bit_mask);
+    // 0xff where q1 bit is zero, 0x00 where q1 bit is set
+    return _mm256_cmpeq_epi8(qbit, zero);
+}
 
-                    GGML_GEMM_Q1_0_4COL(1, 2, 4, 8, 0, 1, 2, 3, 0)
-                    GGML_GEMM_Q1_0_4COL(16, 32, 64, -128, 4, 5, 6, 7, 4)
+// xor-sub pairs: accumulate in int16 (safe: 8*2*127=2032 < 32767)
+static inline __m256i ggml_q1_dotpairs_xorsub_i16(
+        __m256i negmask,
+        __m256i yrep,
+        __m256i ones_8) {
+    const __m256i sy = _mm256_sub_epi8(_mm256_xor_si256(yrep, negmask), negmask);
+    return _mm256_maddubs_epi16(ones_8, sy);
+}
+
+// Bit extraction as 0/1 for positive-sum formulation: dot = 2*pos - total
+static inline __m256i ggml_q1_bit01_8cols(
+        uint32_t qpack,
+        __m256i byte_sel,
+        __m256i bit_mask,
+        __m256i ones_8,
+        __m256i zero) {
+    const __m256i qsrc  = _mm256_set1_epi32((int32_t) qpack);
+    const __m256i qbyte = _mm256_shuffle_epi8(qsrc, byte_sel);
+    const __m256i qbit  = _mm256_and_si256(qbyte, bit_mask);
+    const __m256i is_zero = _mm256_cmpeq_epi8(qbit, zero);
+    return _mm256_andnot_si256(is_zero, ones_8);
+}
+
+static inline __m256i ggml_q8_totalpairs_i16(
+        __m256i yrep,
+        __m256i ones_8) {
+    return _mm256_maddubs_epi16(ones_8, yrep);
+}
+
+static inline __m256i ggml_q1_pospairs_i16(
+        __m256i bit01,
+        __m256i yrep) {
+    return _mm256_maddubs_epi16(bit01, yrep);
+}
+
+void ggml_gemv_q1_0_8x4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
+#if defined(__AVX2__) && defined(__FMA__)
+    assert(n % QK1_0 == 0);
+    assert(nc % 16 == 0);
+    assert(nr == 1);
+
+    UNUSED(bs);
+    UNUSED(nr);
+
+    const int nb = n / QK1_0;
+
+    const block_q1_0x8 * GGML_RESTRICT x = (const block_q1_0x8 *) vx;
+    const block_q8_0 * GGML_RESTRICT y = (const block_q8_0 *) vy;
+
+    const __m256i byte_sel = _mm256_loadu_si256((const __m256i *) q1_byte_sel);
+    const __m256i bit_mask = _mm256_loadu_si256((const __m256i *) q1_bit_mask);
+    const __m256i ones_8 = _mm256_set1_epi8(1);
+    const __m256i ones_16 = _mm256_set1_epi16(1);
+    const __m256i zero = _mm256_setzero_si256();
+
+  // 48-column main loop (AVX-512 register file) / 32-column (AVX2)
+#if defined(__AVX512VL__)
+     {
+        const int ncols48 = nc / 48;
+        const int nc_tail = nc - ncols48 * 48;
+
+        for (int cx = 0; cx < ncols48; ++cx) {
+            const block_q1_0x8 * GGML_RESTRICT x0 = x + (size_t)(cx * 6) * nb;
+            const block_q1_0x8 * GGML_RESTRICT x1 = x0 + nb;
+            const block_q1_0x8 * GGML_RESTRICT x2 = x1 + nb;
+            const block_q1_0x8 * GGML_RESTRICT x3 = x2 + nb;
+            const block_q1_0x8 * GGML_RESTRICT x4 = x3 + nb;
+            const block_q1_0x8 * GGML_RESTRICT x5 = x4 + nb;
+
+            __m256 acc0 = _mm256_setzero_ps();
+            __m256 acc1 = _mm256_setzero_ps();
+            __m256 acc2 = _mm256_setzero_ps();
+            __m256 acc3 = _mm256_setzero_ps();
+            __m256 acc4 = _mm256_setzero_ps();
+            __m256 acc5 = _mm256_setzero_ps();
+
+            for (int l = 0; l < nb; ++l) {
+                __m256 tmp0 = _mm256_setzero_ps();
+                __m256 tmp1 = _mm256_setzero_ps();
+                __m256 tmp2 = _mm256_setzero_ps();
+                __m256 tmp3 = _mm256_setzero_ps();
+                __m256 tmp4 = _mm256_setzero_ps();
+                __m256 tmp5 = _mm256_setzero_ps();
+
+                for (int sb = 0; sb < 4; ++sb) {
+                    const block_q8_0 * GGML_RESTRICT yb = &y[l * 4 + sb];
+
+                    __m256i total16 = _mm256_setzero_si256();
+                    __m256i pos0 = _mm256_setzero_si256();
+                    __m256i pos1 = _mm256_setzero_si256();
+                    __m256i pos2 = _mm256_setzero_si256();
+                    __m256i pos3 = _mm256_setzero_si256();
+                    __m256i pos4 = _mm256_setzero_si256();
+                    __m256i pos5 = _mm256_setzero_si256();
+
+                    for (int g = 0; g < 8; ++g) {
+                        const __m256i yrep = _mm256_set1_epi32(ggml_load_u32(yb->qs + g * 4));
+
+                        total16 = _mm256_add_epi16(total16, ggml_q8_totalpairs_i16(yrep, ones_8));
+
+                        const uint32_t qpack0 = ggml_load_u32(x0[l].qs + (sb * 8 + g) * 4);
+                        const __m256i bit0 = ggml_q1_bit01_8cols(qpack0, byte_sel, bit_mask, ones_8, zero);
+                        pos0 = _mm256_add_epi16(pos0, ggml_q1_pospairs_i16(bit0, yrep));
+
+                        const uint32_t qpack1 = ggml_load_u32(x1[l].qs + (sb * 8 + g) * 4);
+                        const __m256i bit1 = ggml_q1_bit01_8cols(qpack1, byte_sel, bit_mask, ones_8, zero);
+                        pos1 = _mm256_add_epi16(pos1, ggml_q1_pospairs_i16(bit1, yrep));
+
+                        const uint32_t qpack2 = ggml_load_u32(x2[l].qs + (sb * 8 + g) * 4);
+                        const __m256i bit2 = ggml_q1_bit01_8cols(qpack2, byte_sel, bit_mask, ones_8, zero);
+                        pos2 = _mm256_add_epi16(pos2, ggml_q1_pospairs_i16(bit2, yrep));
+
+                        const uint32_t qpack3 = ggml_load_u32(x3[l].qs + (sb * 8 + g) * 4);
+                        const __m256i bit3 = ggml_q1_bit01_8cols(qpack3, byte_sel, bit_mask, ones_8, zero);
+                        pos3 = _mm256_add_epi16(pos3, ggml_q1_pospairs_i16(bit3, yrep));
+
+                        const uint32_t qpack4 = ggml_load_u32(x4[l].qs + (sb * 8 + g) * 4);
+                        const __m256i bit4 = ggml_q1_bit01_8cols(qpack4, byte_sel, bit_mask, ones_8, zero);
+                        pos4 = _mm256_add_epi16(pos4, ggml_q1_pospairs_i16(bit4, yrep));
+
+                        const uint32_t qpack5 = ggml_load_u32(x5[l].qs + (sb * 8 + g) * 4);
+                        const __m256i bit5 = ggml_q1_bit01_8cols(qpack5, byte_sel, bit_mask, ones_8, zero);
+                        pos5 = _mm256_add_epi16(pos5, ggml_q1_pospairs_i16(bit5, yrep));
+                    }
+
+                    const __m256i dot0_16 = _mm256_sub_epi16(_mm256_add_epi16(pos0, pos0), total16);
+                    const __m256i dot1_16 = _mm256_sub_epi16(_mm256_add_epi16(pos1, pos1), total16);
+                    const __m256i dot2_16 = _mm256_sub_epi16(_mm256_add_epi16(pos2, pos2), total16);
+                    const __m256i dot3_16 = _mm256_sub_epi16(_mm256_add_epi16(pos3, pos3), total16);
+                    const __m256i dot4_16 = _mm256_sub_epi16(_mm256_add_epi16(pos4, pos4), total16);
+                    const __m256i dot5_16 = _mm256_sub_epi16(_mm256_add_epi16(pos5, pos5), total16);
+
+                    const __m256 ydv = _mm256_set1_ps(GGML_CPU_FP16_TO_FP32(yb->d));
+                    tmp0 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_madd_epi16(dot0_16, ones_16)), ydv, tmp0);
+                    tmp1 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_madd_epi16(dot1_16, ones_16)), ydv, tmp1);
+                    tmp2 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_madd_epi16(dot2_16, ones_16)), ydv, tmp2);
+                    tmp3 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_madd_epi16(dot3_16, ones_16)), ydv, tmp3);
+                    tmp4 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_madd_epi16(dot4_16, ones_16)), ydv, tmp4);
+                    tmp5 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_madd_epi16(dot5_16, ones_16)), ydv, tmp5);
                 }
+
+                const __m256 bdv0 = GGML_F32Cx8_LOAD(x0[l].d);
+                const __m256 bdv1 = GGML_F32Cx8_LOAD(x1[l].d);
+                const __m256 bdv2 = GGML_F32Cx8_LOAD(x2[l].d);
+                const __m256 bdv3 = GGML_F32Cx8_LOAD(x3[l].d);
+                const __m256 bdv4 = GGML_F32Cx8_LOAD(x4[l].d);
+                const __m256 bdv5 = GGML_F32Cx8_LOAD(x5[l].d);
+
+                acc0 = _mm256_fmadd_ps(tmp0, bdv0, acc0);
+                acc1 = _mm256_fmadd_ps(tmp1, bdv1, acc1);
+                acc2 = _mm256_fmadd_ps(tmp2, bdv2, acc2);
+                acc3 = _mm256_fmadd_ps(tmp3, bdv3, acc3);
+                acc4 = _mm256_fmadd_ps(tmp4, bdv4, acc4);
+                acc5 = _mm256_fmadd_ps(tmp5, bdv5, acc5);
             }
+
+            float *sbase = s + cx * 48;
+            _mm256_storeu_ps(sbase + 0, acc0);
+            _mm256_storeu_ps(sbase + 8, acc1);
+            _mm256_storeu_ps(sbase + 16, acc2);
+            _mm256_storeu_ps(sbase + 24, acc3);
+            _mm256_storeu_ps(sbase + 32, acc4);
+            _mm256_storeu_ps(sbase + 40, acc5);
         }
 
-        return;
-    }
-#endif // defined( __AVX2__ ) || defined( __AVX512F__ )
+        // 32-column tail
+        if (nc_tail >= 32) {
+            const block_q1_0x8 * GGML_RESTRICT xa = x + (size_t)(ncols48 * 6) * nb;
+            const block_q1_0x8 * GGML_RESTRICT xb = xa + nb;
+            const block_q1_0x8 * GGML_RESTRICT xc = xb + nb;
+            const block_q1_0x8 * GGML_RESTRICT xd = xc + nb;
 
-    ggml_gemm_q1_0_8x32_q8_0_generic(n, s, bs, vx, vy, nr, nc);
+            __m256 acca = _mm256_setzero_ps();
+            __m256 accb = _mm256_setzero_ps();
+            __m256 accc = _mm256_setzero_ps();
+            __m256 accd = _mm256_setzero_ps();
+
+            for (int l = 0; l < nb; ++l) {
+                __m256 tmpa = _mm256_setzero_ps();
+                __m256 tmpb = _mm256_setzero_ps();
+                __m256 tmpc = _mm256_setzero_ps();
+                __m256 tmpd = _mm256_setzero_ps();
+
+                for (int sb = 0; sb < 4; ++sb) {
+                    const block_q8_0 * GGML_RESTRICT yb = &y[l * 4 + sb];
+
+                    __m256i total16 = _mm256_setzero_si256();
+                    __m256i posa = _mm256_setzero_si256();
+                    __m256i posb = _mm256_setzero_si256();
+                    __m256i posc = _mm256_setzero_si256();
+                    __m256i posd = _mm256_setzero_si256();
+
+                    for (int g = 0; g < 8; ++g) {
+                        const __m256i yrep = _mm256_set1_epi32(ggml_load_u32(yb->qs + g * 4));
+
+                        total16 = _mm256_add_epi16(total16, ggml_q8_totalpairs_i16(yrep, ones_8));
+
+                        const uint32_t qpacka = ggml_load_u32(xa[l].qs + (sb * 8 + g) * 4);
+                        const __m256i bita = ggml_q1_bit01_8cols(qpacka, byte_sel, bit_mask, ones_8, zero);
+                        posa = _mm256_add_epi16(posa, ggml_q1_pospairs_i16(bita, yrep));
+
+                        const uint32_t qpackb = ggml_load_u32(xb[l].qs + (sb * 8 + g) * 4);
+                        const __m256i bitb = ggml_q1_bit01_8cols(qpackb, byte_sel, bit_mask, ones_8, zero);
+                        posb = _mm256_add_epi16(posb, ggml_q1_pospairs_i16(bitb, yrep));
+
+                        const uint32_t qpackc = ggml_load_u32(xc[l].qs + (sb * 8 + g) * 4);
+                        const __m256i bitc = ggml_q1_bit01_8cols(qpackc, byte_sel, bit_mask, ones_8, zero);
+                        posc = _mm256_add_epi16(posc, ggml_q1_pospairs_i16(bitc, yrep));
+
+                        const uint32_t qpackd = ggml_load_u32(xd[l].qs + (sb * 8 + g) * 4);
+                        const __m256i bitd = ggml_q1_bit01_8cols(qpackd, byte_sel, bit_mask, ones_8, zero);
+                        posd = _mm256_add_epi16(posd, ggml_q1_pospairs_i16(bitd, yrep));
+                    }
+
+                    const __m256i dota_16 = _mm256_sub_epi16(_mm256_add_epi16(posa, posa), total16);
+                    const __m256i dotb_16 = _mm256_sub_epi16(_mm256_add_epi16(posb, posb), total16);
+                    const __m256i dotc_16 = _mm256_sub_epi16(_mm256_add_epi16(posc, posc), total16);
+                    const __m256i dotd_16 = _mm256_sub_epi16(_mm256_add_epi16(posd, posd), total16);
+
+                    const __m256 ydv = _mm256_set1_ps(GGML_CPU_FP16_TO_FP32(yb->d));
+                    tmpa = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_madd_epi16(dota_16, ones_16)), ydv, tmpa);
+                    tmpb = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_madd_epi16(dotb_16, ones_16)), ydv, tmpb);
+                    tmpc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_madd_epi16(dotc_16, ones_16)), ydv, tmpc);
+                    tmpd = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_madd_epi16(dotd_16, ones_16)), ydv, tmpd);
+                }
+
+                const __m256 bdva = GGML_F32Cx8_LOAD(xa[l].d);
+                const __m256 bdvb = GGML_F32Cx8_LOAD(xb[l].d);
+                const __m256 bdvc = GGML_F32Cx8_LOAD(xc[l].d);
+                const __m256 bdvd = GGML_F32Cx8_LOAD(xd[l].d);
+
+                acca = _mm256_fmadd_ps(tmpa, bdva, acca);
+                accb = _mm256_fmadd_ps(tmpb, bdvb, accb);
+                accc = _mm256_fmadd_ps(tmpc, bdvc, accc);
+                accd = _mm256_fmadd_ps(tmpd, bdvd, accd);
+            }
+
+            float *sbase = s + ncols48 * 48;
+            _mm256_storeu_ps(sbase + 0, acca);
+            _mm256_storeu_ps(sbase + 8, accb);
+            _mm256_storeu_ps(sbase + 16, accc);
+            _mm256_storeu_ps(sbase + 24, accd);
+        }
+
+        // 16-column tail
+        if (nc_tail == 16) {
+            const block_q1_0x8 * GGML_RESTRICT xa = x + (size_t)(ncols48 * 6) * nb;
+            const block_q1_0x8 * GGML_RESTRICT xb = xa + nb;
+
+            __m256 acca = _mm256_setzero_ps();
+            __m256 accb = _mm256_setzero_ps();
+
+            for (int l = 0; l < nb; ++l) {
+                __m256 tmpa = _mm256_setzero_ps();
+                __m256 tmpb = _mm256_setzero_ps();
+
+                for (int sb = 0; sb < 4; ++sb) {
+                    const block_q8_0 * GGML_RESTRICT yb = &y[l * 4 + sb];
+
+                    __m256i total16 = _mm256_setzero_si256();
+                    __m256i posa = _mm256_setzero_si256();
+                    __m256i posb = _mm256_setzero_si256();
+
+                    for (int g = 0; g < 8; ++g) {
+                        const __m256i yrep = _mm256_set1_epi32(ggml_load_u32(yb->qs + g * 4));
+
+                        total16 = _mm256_add_epi16(total16, ggml_q8_totalpairs_i16(yrep, ones_8));
+
+                        const uint32_t qpacka = ggml_load_u32(xa[l].qs + (sb * 8 + g) * 4);
+                        const __m256i bita = ggml_q1_bit01_8cols(qpacka, byte_sel, bit_mask, ones_8, zero);
+                        posa = _mm256_add_epi16(posa, ggml_q1_pospairs_i16(bita, yrep));
+
+                        const uint32_t qpackb = ggml_load_u32(xb[l].qs + (sb * 8 + g) * 4);
+                        const __m256i bitb = ggml_q1_bit01_8cols(qpackb, byte_sel, bit_mask, ones_8, zero);
+                        posb = _mm256_add_epi16(posb, ggml_q1_pospairs_i16(bitb, yrep));
+                    }
+
+                    const __m256i dota_16 = _mm256_sub_epi16(_mm256_add_epi16(posa, posa), total16);
+                    const __m256i dotb_16 = _mm256_sub_epi16(_mm256_add_epi16(posb, posb), total16);
+
+                    const __m256 ydv = _mm256_set1_ps(GGML_CPU_FP16_TO_FP32(yb->d));
+                    tmpa = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_madd_epi16(dota_16, ones_16)), ydv, tmpa);
+                    tmpb = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_madd_epi16(dotb_16, ones_16)), ydv, tmpb);
+                }
+
+                const __m256 bdva = GGML_F32Cx8_LOAD(xa[l].d);
+                const __m256 bdvb = GGML_F32Cx8_LOAD(xb[l].d);
+
+                acca = _mm256_fmadd_ps(tmpa, bdva, acca);
+                accb = _mm256_fmadd_ps(tmpb, bdvb, accb);
+            }
+
+            float *sbase = s + ncols48 * 48;
+            _mm256_storeu_ps(sbase, acca);
+            _mm256_storeu_ps(sbase + 8, accb);
+        }
+    }
+#else
+     {
+        const int ncols32 = nc / 32;
+        const int nc_tail = nc - ncols32 * 32;
+
+        for (int cx = 0; cx < ncols32; ++cx) {
+            const block_q1_0x8 * GGML_RESTRICT x0 = x + (size_t)(cx * 4) * nb;
+            const block_q1_0x8 * GGML_RESTRICT x1 = x0 + nb;
+            const block_q1_0x8 * GGML_RESTRICT x2 = x1 + nb;
+            const block_q1_0x8 * GGML_RESTRICT x3 = x2 + nb;
+
+            __m256 acc0 = _mm256_setzero_ps();
+            __m256 acc1 = _mm256_setzero_ps();
+            __m256 acc2 = _mm256_setzero_ps();
+            __m256 acc3 = _mm256_setzero_ps();
+
+            for (int l = 0; l < nb; ++l) {
+                __m256 tmp0 = _mm256_setzero_ps();
+                __m256 tmp1 = _mm256_setzero_ps();
+                __m256 tmp2 = _mm256_setzero_ps();
+                __m256 tmp3 = _mm256_setzero_ps();
+
+                for (int sb = 0; sb < 4; ++sb) {
+                    const block_q8_0 * GGML_RESTRICT yb = &y[l * 4 + sb];
+
+                    __m256i total16 = _mm256_setzero_si256();
+                    __m256i pos0 = _mm256_setzero_si256();
+                    __m256i pos1 = _mm256_setzero_si256();
+                    __m256i pos2 = _mm256_setzero_si256();
+                    __m256i pos3 = _mm256_setzero_si256();
+
+                    for (int g = 0; g < 8; ++g) {
+                        const __m256i yrep = _mm256_set1_epi32(ggml_load_u32(yb->qs + g * 4));
+
+                        total16 = _mm256_add_epi16(total16, ggml_q8_totalpairs_i16(yrep, ones_8));
+
+                        const uint32_t qpack0 = ggml_load_u32(x0[l].qs + (sb * 8 + g) * 4);
+                        const __m256i bit0 = ggml_q1_bit01_8cols(qpack0, byte_sel, bit_mask, ones_8, zero);
+                        pos0 = _mm256_add_epi16(pos0, ggml_q1_pospairs_i16(bit0, yrep));
+
+                        const uint32_t qpack1 = ggml_load_u32(x1[l].qs + (sb * 8 + g) * 4);
+                        const __m256i bit1 = ggml_q1_bit01_8cols(qpack1, byte_sel, bit_mask, ones_8, zero);
+                        pos1 = _mm256_add_epi16(pos1, ggml_q1_pospairs_i16(bit1, yrep));
+
+                        const uint32_t qpack2 = ggml_load_u32(x2[l].qs + (sb * 8 + g) * 4);
+                        const __m256i bit2 = ggml_q1_bit01_8cols(qpack2, byte_sel, bit_mask, ones_8, zero);
+                        pos2 = _mm256_add_epi16(pos2, ggml_q1_pospairs_i16(bit2, yrep));
+
+                        const uint32_t qpack3 = ggml_load_u32(x3[l].qs + (sb * 8 + g) * 4);
+                        const __m256i bit3 = ggml_q1_bit01_8cols(qpack3, byte_sel, bit_mask, ones_8, zero);
+                        pos3 = _mm256_add_epi16(pos3, ggml_q1_pospairs_i16(bit3, yrep));
+                    }
+
+                    const __m256i dot0_16 = _mm256_sub_epi16(_mm256_add_epi16(pos0, pos0), total16);
+                    const __m256i dot1_16 = _mm256_sub_epi16(_mm256_add_epi16(pos1, pos1), total16);
+                    const __m256i dot2_16 = _mm256_sub_epi16(_mm256_add_epi16(pos2, pos2), total16);
+                    const __m256i dot3_16 = _mm256_sub_epi16(_mm256_add_epi16(pos3, pos3), total16);
+
+                    const __m256 ydv = _mm256_set1_ps(GGML_CPU_FP16_TO_FP32(yb->d));
+                    tmp0 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_madd_epi16(dot0_16, ones_16)), ydv, tmp0);
+                    tmp1 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_madd_epi16(dot1_16, ones_16)), ydv, tmp1);
+                    tmp2 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_madd_epi16(dot2_16, ones_16)), ydv, tmp2);
+                    tmp3 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_madd_epi16(dot3_16, ones_16)), ydv, tmp3);
+                }
+
+                const __m256 bdv0 = GGML_F32Cx8_LOAD(x0[l].d);
+                const __m256 bdv1 = GGML_F32Cx8_LOAD(x1[l].d);
+                const __m256 bdv2 = GGML_F32Cx8_LOAD(x2[l].d);
+                const __m256 bdv3 = GGML_F32Cx8_LOAD(x3[l].d);
+
+                acc0 = _mm256_fmadd_ps(tmp0, bdv0, acc0);
+                acc1 = _mm256_fmadd_ps(tmp1, bdv1, acc1);
+                acc2 = _mm256_fmadd_ps(tmp2, bdv2, acc2);
+                acc3 = _mm256_fmadd_ps(tmp3, bdv3, acc3);
+            }
+
+            float *sbase = s + cx * 32;
+            _mm256_storeu_ps(sbase + 0, acc0);
+            _mm256_storeu_ps(sbase + 8, acc1);
+            _mm256_storeu_ps(sbase + 16, acc2);
+            _mm256_storeu_ps(sbase + 24, acc3);
+        }
+
+        // 16-column tail
+        if (nc_tail >= 16) {
+            const block_q1_0x8 * GGML_RESTRICT xa = x + (size_t)(ncols32 * 4) * nb;
+            const block_q1_0x8 * GGML_RESTRICT xb = xa + nb;
+
+            __m256 acca = _mm256_setzero_ps();
+            __m256 accb = _mm256_setzero_ps();
+
+            for (int l = 0; l < nb; ++l) {
+                __m256 tmpa = _mm256_setzero_ps();
+                __m256 tmpb = _mm256_setzero_ps();
+
+                for (int sb = 0; sb < 4; ++sb) {
+                    const block_q8_0 * GGML_RESTRICT yb = &y[l * 4 + sb];
+
+                    __m256i total16 = _mm256_setzero_si256();
+                    __m256i posa = _mm256_setzero_si256();
+                    __m256i posb = _mm256_setzero_si256();
+
+                    for (int g = 0; g < 8; ++g) {
+                        const __m256i yrep = _mm256_set1_epi32(ggml_load_u32(yb->qs + g * 4));
+
+                        total16 = _mm256_add_epi16(total16, ggml_q8_totalpairs_i16(yrep, ones_8));
+
+                        const uint32_t qpacka = ggml_load_u32(xa[l].qs + (sb * 8 + g) * 4);
+                        const __m256i bita = ggml_q1_bit01_8cols(qpacka, byte_sel, bit_mask, ones_8, zero);
+                        posa = _mm256_add_epi16(posa, ggml_q1_pospairs_i16(bita, yrep));
+
+                        const uint32_t qpackb = ggml_load_u32(xb[l].qs + (sb * 8 + g) * 4);
+                        const __m256i bitb = ggml_q1_bit01_8cols(qpackb, byte_sel, bit_mask, ones_8, zero);
+                        posb = _mm256_add_epi16(posb, ggml_q1_pospairs_i16(bitb, yrep));
+                    }
+
+                    const __m256i dota_16 = _mm256_sub_epi16(_mm256_add_epi16(posa, posa), total16);
+                    const __m256i dotb_16 = _mm256_sub_epi16(_mm256_add_epi16(posb, posb), total16);
+
+                    const __m256 ydv = _mm256_set1_ps(GGML_CPU_FP16_TO_FP32(yb->d));
+                    tmpa = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_madd_epi16(dota_16, ones_16)), ydv, tmpa);
+                    tmpb = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_madd_epi16(dotb_16, ones_16)), ydv, tmpb);
+                }
+
+                const __m256 bdva = GGML_F32Cx8_LOAD(xa[l].d);
+                const __m256 bdvb = GGML_F32Cx8_LOAD(xb[l].d);
+
+                acca = _mm256_fmadd_ps(tmpa, bdva, acca);
+                accb = _mm256_fmadd_ps(tmpb, bdvb, accb);
+            }
+
+            _mm256_storeu_ps(s + ncols32 * 32, acca);
+            _mm256_storeu_ps(s + ncols32 * 32 + 8, accb);
+        }
+    }
+#endif // __AVX512VL__
+
+    return;
+#else
+    ggml_gemv_q1_0_8x4_q8_0_generic(n, s, bs, vx, vy, nr, nc);
+#endif
+}
+
+void ggml_gemm_q1_0_8x4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
+#if defined(__AVX2__) && defined(__FMA__)
+    assert(n % QK1_0 == 0);
+    assert(nr % 4 == 0);
+    assert(nc % 16 == 0);
+
+    const int nb = n / QK1_0;
+    const int nb_q8_0 = n / QK8_0;
+    const int ncols16 = nc / 16;
+    const int nrows4 = nr / 4;
+
+    const block_q1_0x8 * vx_bi = (const block_q1_0x8 *)vx;
+
+    const __m256i byte_sel = _mm256_loadu_si256((const __m256i *) q1_byte_sel);
+    const __m256i bit_mask = _mm256_loadu_si256((const __m256i *) q1_bit_mask);
+    const __m256i ones_8 = _mm256_set1_epi8(1);
+    const __m256i ones_16 = _mm256_set1_epi16(1);
+    const __m256i zero = _mm256_setzero_si256();
+
+    for (int y = 0; y < nrows4; ++y) {
+        const block_q8_0x4 * a_ptr = (const block_q8_0x4 *)vy + (y * nb_q8_0);
+
+        for (int x = 0; x < ncols16; ++x) {
+            const block_q1_0x8 * ba = vx_bi + (size_t)(x * 2) * nb;
+            const block_q1_0x8 * bb = ba + nb;
+
+            __m256 acc0a = _mm256_setzero_ps();
+            __m256 acc1a = _mm256_setzero_ps();
+            __m256 acc2a = _mm256_setzero_ps();
+            __m256 acc3a = _mm256_setzero_ps();
+            __m256 acc0b = _mm256_setzero_ps();
+            __m256 acc1b = _mm256_setzero_ps();
+            __m256 acc2b = _mm256_setzero_ps();
+            __m256 acc3b = _mm256_setzero_ps();
+
+            for (int l = 0; l < nb; ++l) {
+                __m256 tmp0a = _mm256_setzero_ps();
+                __m256 tmp1a = _mm256_setzero_ps();
+                __m256 tmp2a = _mm256_setzero_ps();
+                __m256 tmp3a = _mm256_setzero_ps();
+                __m256 tmp0b = _mm256_setzero_ps();
+                __m256 tmp1b = _mm256_setzero_ps();
+                __m256 tmp2b = _mm256_setzero_ps();
+                __m256 tmp3b = _mm256_setzero_ps();
+
+                for (int sb = 0; sb < 4; ++sb) {
+                    const block_q8_0x4 * yb = &a_ptr[l * 4 + sb];
+
+                    __m256i isum0a16 = _mm256_setzero_si256();
+                    __m256i isum1a16 = _mm256_setzero_si256();
+                    __m256i isum2a16 = _mm256_setzero_si256();
+                    __m256i isum3a16 = _mm256_setzero_si256();
+                    __m256i isum0b16 = _mm256_setzero_si256();
+                    __m256i isum1b16 = _mm256_setzero_si256();
+                    __m256i isum2b16 = _mm256_setzero_si256();
+                    __m256i isum3b16 = _mm256_setzero_si256();
+
+                   for (int g = 0; g < 8; ++g) {
+                        const uint32_t qpacka = ggml_load_u32(ba[l].qs + (sb * 8 + g) * 4);
+                        const __m256i nega = ggml_q1_negmask_8cols(qpacka, byte_sel, bit_mask, zero);
+                        const uint32_t qpackb = ggml_load_u32(bb[l].qs + (sb * 8 + g) * 4);
+                        const __m256i negb = ggml_q1_negmask_8cols(qpackb, byte_sel, bit_mask, zero);
+
+                        const __m256i yrep0 = _mm256_set1_epi32(ggml_load_u32(yb->qs + g * 16 + 0 * 4));
+                        const __m256i yrep1 = _mm256_set1_epi32(ggml_load_u32(yb->qs + g * 16 + 1 * 4));
+                        const __m256i yrep2 = _mm256_set1_epi32(ggml_load_u32(yb->qs + g * 16 + 2 * 4));
+                        const __m256i yrep3 = _mm256_set1_epi32(ggml_load_u32(yb->qs + g * 16 + 3 * 4));
+
+                        isum0a16 = _mm256_add_epi16(isum0a16, ggml_q1_dotpairs_xorsub_i16(nega, yrep0, ones_8));
+                        isum1a16 = _mm256_add_epi16(isum1a16, ggml_q1_dotpairs_xorsub_i16(nega, yrep1, ones_8));
+                        isum2a16 = _mm256_add_epi16(isum2a16, ggml_q1_dotpairs_xorsub_i16(nega, yrep2, ones_8));
+                        isum3a16 = _mm256_add_epi16(isum3a16, ggml_q1_dotpairs_xorsub_i16(nega, yrep3, ones_8));
+
+                        isum0b16 = _mm256_add_epi16(isum0b16, ggml_q1_dotpairs_xorsub_i16(negb, yrep0, ones_8));
+                        isum1b16 = _mm256_add_epi16(isum1b16, ggml_q1_dotpairs_xorsub_i16(negb, yrep1, ones_8));
+                        isum2b16 = _mm256_add_epi16(isum2b16, ggml_q1_dotpairs_xorsub_i16(negb, yrep2, ones_8));
+                        isum3b16 = _mm256_add_epi16(isum3b16, ggml_q1_dotpairs_xorsub_i16(negb, yrep3, ones_8));
+                    }
+
+                    const __m256i isum0a = _mm256_madd_epi16(isum0a16, ones_16);
+                    const __m256i isum1a = _mm256_madd_epi16(isum1a16, ones_16);
+                    const __m256i isum2a = _mm256_madd_epi16(isum2a16, ones_16);
+                    const __m256i isum3a = _mm256_madd_epi16(isum3a16, ones_16);
+                    const __m256i isum0b = _mm256_madd_epi16(isum0b16, ones_16);
+                    const __m256i isum1b = _mm256_madd_epi16(isum1b16, ones_16);
+                    const __m256i isum2b = _mm256_madd_epi16(isum2b16, ones_16);
+                    const __m256i isum3b = _mm256_madd_epi16(isum3b16, ones_16);
+
+                    const __m256 yd_all = ggml_cvt_fp16x4_to_fp32x2(yb->d);
+                    const __m256 yd0 = _mm256_permute_ps(yd_all, 0);
+                    const __m256 yd1 = _mm256_permute_ps(yd_all, 85);
+                    const __m256 yd2 = _mm256_permute_ps(yd_all, 170);
+                    const __m256 yd3 = _mm256_permute_ps(yd_all, 255);
+                    tmp0a = _mm256_fmadd_ps(_mm256_cvtepi32_ps(isum0a), yd0, tmp0a);
+                    tmp1a = _mm256_fmadd_ps(_mm256_cvtepi32_ps(isum1a), yd1, tmp1a);
+                    tmp2a = _mm256_fmadd_ps(_mm256_cvtepi32_ps(isum2a), yd2, tmp2a);
+                    tmp3a = _mm256_fmadd_ps(_mm256_cvtepi32_ps(isum3a), yd3, tmp3a);
+                    tmp0b = _mm256_fmadd_ps(_mm256_cvtepi32_ps(isum0b), yd0, tmp0b);
+                    tmp1b = _mm256_fmadd_ps(_mm256_cvtepi32_ps(isum1b), yd1, tmp1b);
+                    tmp2b = _mm256_fmadd_ps(_mm256_cvtepi32_ps(isum2b), yd2, tmp2b);
+                    tmp3b = _mm256_fmadd_ps(_mm256_cvtepi32_ps(isum3b), yd3, tmp3b);
+                }
+
+                const __m256 bdva = GGML_F32Cx8_LOAD(ba[l].d);
+                const __m256 bdvb = GGML_F32Cx8_LOAD(bb[l].d);
+
+                acc0a = _mm256_fmadd_ps(tmp0a, bdva, acc0a);
+                acc1a = _mm256_fmadd_ps(tmp1a, bdva, acc1a);
+                acc2a = _mm256_fmadd_ps(tmp2a, bdva, acc2a);
+                acc3a = _mm256_fmadd_ps(tmp3a, bdva, acc3a);
+                acc0b = _mm256_fmadd_ps(tmp0b, bdvb, acc0b);
+                acc1b = _mm256_fmadd_ps(tmp1b, bdvb, acc1b);
+                acc2b = _mm256_fmadd_ps(tmp2b, bdvb, acc2b);
+                acc3b = _mm256_fmadd_ps(tmp3b, bdvb, acc3b);
+            }
+
+            _mm256_storeu_ps(s + (y * 4 + 0) * bs + x * 16, acc0a);
+            _mm256_storeu_ps(s + (y * 4 + 1) * bs + x * 16, acc1a);
+            _mm256_storeu_ps(s + (y * 4 + 2) * bs + x * 16, acc2a);
+            _mm256_storeu_ps(s + (y * 4 + 3) * bs + x * 16, acc3a);
+            _mm256_storeu_ps(s + (y * 4 + 0) * bs + x * 16 + 8, acc0b);
+            _mm256_storeu_ps(s + (y * 4 + 1) * bs + x * 16 + 8, acc1b);
+            _mm256_storeu_ps(s + (y * 4 + 2) * bs + x * 16 + 8, acc2b);
+            _mm256_storeu_ps(s + (y * 4 + 3) * bs + x * 16 + 8, acc3b);
+        }
+    }
+
+    return;
+#else
+    ggml_gemm_q1_0_8x4_q8_0_generic(n, s, bs, vx, vy, nr, nc);
+#endif
 }
 
 void ggml_gemm_q4_K_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
