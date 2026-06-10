@@ -149,6 +149,12 @@ if (CUDAToolkit_FOUND)
         string(REPLACE ";" " " CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS}")
     endif()
 
+    if (GGML_CUDA_HOPPER_Q1_PTX)
+        # CUTLASS-free wgmma path (inline PTX); needs sm_90a in CMAKE_CUDA_ARCHITECTURES, like
+        # GGML_CUDA_HOPPER_Q1, but no external headers. Both may be enabled for runtime A/B.
+        add_compile_definitions(GGML_USE_HOPPER_Q1_PTX)
+    endif()
+
     if (GGML_CUDA_FORCE_CUBLAS)
         add_compile_definitions(GGML_CUDA_FORCE_CUBLAS)
     endif()

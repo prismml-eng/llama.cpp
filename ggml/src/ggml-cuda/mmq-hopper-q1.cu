@@ -389,11 +389,23 @@ __global__ __launch_bounds__(512) void lowbit_wgmma_ggml_sk(const int8_t * __res
 }  // namespace hopper_q1
 #endif  // GGML_USE_HOPPER_Q1
 
+bool ggml_cuda_mul_mat_q1_hopper_ptx(ggml_backend_cuda_context & ctx,
+                                     const ggml_tensor *         src0,
+                                     const ggml_tensor *         src1,
+                                     ggml_tensor *               dst);
+
 // returns false if the shape/arch is unsupported (caller falls through to standard MMQ)
 bool ggml_cuda_mul_mat_q1_hopper(ggml_backend_cuda_context & ctx,
                                  const ggml_tensor *         src0,
                                  const ggml_tensor *         src1,
                                  ggml_tensor *               dst) {
+#if defined(GGML_USE_HOPPER_Q1_PTX)
+    // A/B switch: the CUTLASS-free PTX twin (mmq-hopper-q1-ptx.cu); same env contract otherwise
+    static const bool use_ptx = getenv("GGML_HOPPER_Q1_PTX") != nullptr;
+    if (use_ptx) {
+        return ggml_cuda_mul_mat_q1_hopper_ptx(ctx, src0, src1, dst);
+    }
+#endif
 #if defined(GGML_USE_HOPPER_Q1)
     static const bool enabled = getenv("GGML_HOPPER_Q1") != nullptr;
     if (!enabled) {
