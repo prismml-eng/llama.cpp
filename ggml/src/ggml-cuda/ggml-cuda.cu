@@ -2422,7 +2422,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_mul_mat_f(ctx, src0, src1, nullptr, dst);
     } else if (!split && use_mul_mat_vec_q) {
         ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
-    } else if (!split && use_mul_mat_q && src0->type == GGML_TYPE_Q1_0 && src1->ne[1] >= 128
+    } else if (!split && use_mul_mat_q && (src0->type == GGML_TYPE_Q1_0 || src0->type == GGML_TYPE_Q2_0) && src1->ne[1] >= 128
         && ggml_cuda_mul_mat_q1_hopper(ctx, src0, src1, dst)) {
         // handled by the opt-in Hopper wgmma path (returns false to fall through when unsupported)
     } else if (!split && use_mul_mat_q) {
