@@ -200,6 +200,7 @@ def main() -> None:
         "tq1_0": gguf.LlamaFileType.MOSTLY_TQ1_0,
         "tq2_0": gguf.LlamaFileType.MOSTLY_TQ2_0,
         "q2_0": gguf.LlamaFileType.MOSTLY_Q2_0,
+        "pq2_0": gguf.LlamaFileType.MOSTLY_PQ2_0,
         "auto": gguf.LlamaFileType.GUESSED,
     }
 
