@@ -3,6 +3,26 @@
 #include "quantize.cuh"
 #include "mmid.cuh"
 
+// stream-K is faster on Volta+ but unsafe for some batch shapes:
+//  - split-mode row uses parallel CUDA streams with src1_ncols != ne11 (pool fixup race)
+//  - llama-server --parallel packs multiple slots into one ubatch (ne12/ne13 > 1), which
+//    mis-partitions stream-K tiles and crashes the Q2_0 MMQ path (Turing+; see patches/).
+static bool ggml_cuda_mmq_use_stream_k(const int cc, const int64_t ne12, const int64_t ne13,
+                                       const int64_t src1_ncols, const int64_t ne11) {
+    const bool arch_ok = (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA)
+                      || GGML_CUDA_CC_IS_CDNA(cc);
+    if (!arch_ok) {
+        return false;
+    }
+    if (ne12 > 1 || ne13 > 1) {
+        return false;
+    }
+    if (src1_ncols != ne11) {
+        return false;
+    }
+    return true;
+}
+
 static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
     switch (args.type_x) {
         case GGML_TYPE_Q1_0:
@@ -121,8 +141,7 @@ void ggml_cuda_mul_mat_q(
     const int64_t s03 = src0->nb[3] / ts_src0;
     const int64_t s3  =  dst->nb[3] / ts_dst;
 
-    const bool use_stream_k = (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA)
-                            || GGML_CUDA_CC_IS_CDNA(cc);
+    const bool use_stream_k = ggml_cuda_mmq_use_stream_k(cc, ne12, ne13, ne11, ne11);
 
     // TODO: tighter pool buffer size vs q8 path
     const bool use_native_mxfp4 = blackwell_mma_available(cc) && src0->type == GGML_TYPE_MXFP4;
@@ -250,12 +269,7 @@ void ggml_cuda_op_mul_mat_q(
     // nrows_dst == nrows of the matrix that the kernel writes into
     const int64_t nrows_dst = id == ctx.device ? ne0 : row_diff;
 
-    // The stream-k decomposition is only faster for recent NVIDIA GPUs.
-    // Also its fixup needs to allocate a temporary buffer in the memory pool.
-    // There are multiple parallel CUDA streams for src1_ncols != ne11 which would introduce a race condition for this buffer.
-    const bool use_stream_k = ((GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA)
-                            || GGML_CUDA_CC_IS_CDNA(cc))
-                            && src1_ncols == ne11;
+    const bool use_stream_k = ggml_cuda_mmq_use_stream_k(cc, 1, 1, src1_ncols, ne11);
     const mmq_args args = {
         src0_dd_i, src0->type, (const int *) src1_ddq_i, nullptr, nullptr, dst_dd_i,
         ne00, row_diff, src1_ncols, stride01, ne11, nrows_dst,
